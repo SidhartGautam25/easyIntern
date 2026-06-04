@@ -1,0 +1,1304 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Progress } from "@/components/ui/progress";
+import { supabase } from "@/integrations/supabase/client";
+import { toast } from "sonner";
+import { withStoredDirectoryPassword } from "@/lib/studentCredentials";
+import { assertSendMailOk, getSendMailApiUrl } from "@/lib/sendMailApi";
+import { adminUpsertStudentProfile } from "@/lib/adminProfileUpsert";
+import { createEphemeralSupabaseAuthClient } from "@/lib/createSubUser";
+import { buildStudentCredentialLoginLink } from "@/lib/authRoutes";
+import { captureReferralFromUrl, peekStoredReferralCode, resolveValidReferralCode, logReferralClickFromUrl } from "@/lib/referral";
+import { formatRupees, isLnmuStudent } from "@/lib/feeRules";
+import { resolveStudentFeeBreakdown } from "@/lib/collegeFees";
+import { runClientRazorpayCheckout } from "@/lib/clientRazorpayPayment";
+import { loadRazorpayCheckout } from "@/lib/razorpayCheckout";
+import { baSubjects, bcomSubjects, bscSubjects } from "@/lib/subjectOptions";
+import { displayCollegeName } from "@/lib/collegeDisplay";
+import {
+  checkStudentRegistrationAvailable,
+  registrationFieldErrors,
+} from "@/lib/registrationAvailability";
+import {
+  inferDepartmentFromSubject,
+  matchCollegeRoster,
+  normalizeDegree,
+  normalizeDepartment,
+  normalizeGender,
+  normalizeInternshipMode,
+  normalizeSemester,
+  normalizeSession,
+  normalizeSubject,
+} from "@/lib/collegeRoster";
+import { Eye, EyeOff, Loader2, CheckCircle2, ChevronLeft, ChevronRight, MessageSquare, Info, Upload, FileText } from "lucide-react";
+import { z } from "zod";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter
+} from "@/components/ui/dialog";
+
+const REGISTRATION_HELP_WHATSAPP_URL = "https://whatsapp.com/channel/0029VbC9lvi3bbV8TS7TbB00";
+const REGISTRATION_HELP_PHONE_E164 = "+917050936593";
+const REGISTRATION_HELP_PHONE_DISPLAY = "+91 70509 36593";
+
+type Step = 1 | 2 | 3 | 4 | 5;
+
+const CONSENT_MAX_BYTES = 10 * 1024 * 1024;
+const CONSENT_ACCEPT_MIME = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+  "image/jpg",
+  "image/webp",
+  "image/gif",
+]);
+
+function isAllowedConsentFile(f: File): boolean {
+  const t = (f.type || "").toLowerCase();
+  if (t && CONSENT_ACCEPT_MIME.has(t)) return true;
+  return /\.(pdf|png|jpe?g|webp|gif)$/i.test(f.name || "");
+}
+
+async function uploadConsentLetterToStorage(file: File, emailForPath: string): Promise<string> {
+  const ext = (file.name.split(".").pop() || "pdf").replace(/[^a-zA-Z0-9]/g, "") || "pdf";
+  const safeEmail = emailForPath.replace(/[^a-zA-Z0-9@._-]/g, "_").slice(0, 80);
+  const filePath = `consent-${safeEmail}-${Date.now()}.${ext}`;
+  for (const bucket of ["consent-forms", "logos"]) {
+    const { error: upErr } = await supabase.storage.from(bucket).upload(filePath, file, { upsert: false });
+    if (!upErr) {
+      const { data: pub } = supabase.storage.from(bucket).getPublicUrl(filePath);
+      if (pub?.publicUrl) return pub.publicUrl;
+    }
+  }
+  throw new Error("Could not upload consent letter. Please try again or use a smaller file.");
+}
+
+interface University { id: string; name: string; pisa_fee?: number }
+interface College {
+  id: string;
+  name: string;
+  university_id: string;
+  pisa_fee?: number;
+  fee_base_paise?: number | null;
+  fee_processing_paise?: number | null;
+  show_fee_breakdown?: boolean | null;
+  fees_managed?: boolean | null;
+}
+
+type RegistrationVariant = "public" | "admin" | "cybercafe";
+
+export const RegistrationForm = ({
+  onSuccess,
+  onRegisterAnother,
+  initialData,
+  variant = "public",
+  onAdminComplete,
+}: {
+  onSuccess?: () => void;
+  /** Cyber cafe: remount / open a fresh form for the next student. */
+  onRegisterAnother?: () => void;
+  initialData?: any;
+  variant?: RegistrationVariant;
+  onAdminComplete?: (info: { email: string; full_name: string }) => void;
+}) => {
+  const navigate = useNavigate();
+  const isAdminVariant = variant === "admin";
+  const isCyberCafeVariant = variant === "cybercafe";
+  const [step, setStep] = useState<Step>(1);
+  const [submitting, setSubmitting] = useState(false);
+  const [success, setSuccess] = useState(false);
+  const [paymentSettings, setPaymentSettings] = useState<any>(null);
+
+  // Step 1
+  const [fullName, setFullName] = useState(initialData?.fullName || "");
+  const [gender, setGender] = useState(initialData?.gender || "");
+  const [parentName, setParentName] = useState(initialData?.parentName || "");
+  const [contact, setContact] = useState(initialData?.contact || "");
+  const [email, setEmail] = useState(initialData?.email || "");
+  const [registrationFieldError, setRegistrationFieldError] = useState<{
+    email?: string;
+    phone?: string;
+  }>({});
+  const [checkingRegistration, setCheckingRegistration] = useState(false);
+
+  // Step 2
+  const [unis, setUnis] = useState<University[]>([]);
+  const [colleges, setColleges] = useState<College[]>([]);
+  const [domains, setDomains] = useState<any[]>([]);
+  const [universityId, setUniversityId] = useState(""); // We might need to resolve ID from name if needed
+  const [collegeId, setCollegeId] = useState("");
+  const [degree, setDegree] = useState(initialData?.degree || "");
+  const [departmentName, setDepartmentName] = useState(initialData?.department || "");
+  const [classSem, setClassSem] = useState(initialData?.semester || "");
+  const [session, setSession] = useState(initialData?.session || "");
+  const [subject, setSubject] = useState(initialData?.subject || "");
+  const [rollNo, setRollNo] = useState(initialData?.rollNo || "");
+  const [course, setCourse] = useState(initialData?.course || "");
+  const [internshipMode, setInternshipMode] = useState(
+    (initialData as { internshipMode?: string })?.internshipMode || "Online"
+  );
+
+  // Step 3
+  const [emName, setEmName] = useState(initialData?.emName || "");
+  const [emPhone, setEmPhone] = useState(initialData?.emPhone || "");
+  const [emRel, setEmRel] = useState(initialData?.emRel || "");
+
+  // Step 4
+  const [password, setPassword] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [showPw, setShowPw] = useState(false);
+  const [agree, setAgree] = useState(false);
+
+  const [consentLetterFile, setConsentLetterFile] = useState<File | null>(null);
+  const consentFormUrlRef = useRef<string | null>(null);
+
+  const needsLnmuConsent = useMemo(
+    () => !isAdminVariant && isLnmuStudent(unis.find((u) => u.id === universityId)?.name),
+    [isAdminVariant, universityId, unis]
+  );
+
+  const domainOptions = useMemo(
+    () => domains.map((d) => d.name),
+    [domains]
+  );
+
+  useEffect(() => {
+    if (!needsLnmuConsent) {
+      setConsentLetterFile(null);
+      consentFormUrlRef.current = null;
+      setStep((s) => (s === 5 ? 4 : s));
+    }
+  }, [needsLnmuConsent]);
+
+  // College roster auto-fill state
+  const [rosterStatus, setRosterStatus] = useState<
+    "idle" | "checking" | "matched" | "claimed" | "none" | "ambiguous"
+  >("idle");
+  const [rosterMatchedName, setRosterMatchedName] = useState<string>("");
+  const [rosterAlreadyRegisteredOpen, setRosterAlreadyRegisteredOpen] = useState(false);
+
+  // Save incomplete registrations as leads (public flow only; step ≥ 2).
+  useEffect(() => {
+    if (isAdminVariant || step < 2) return;
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail.includes("@")) return;
+
+    const t = window.setTimeout(async () => {
+      try {
+        const cyberData = JSON.parse(sessionStorage.getItem("cybercafe_profile") || "{}");
+        const selectedCollege = colleges.find((c) => c.id === collegeId);
+        const selectedUni = unis.find((u) => u.id === universityId);
+        const payload: Record<string, unknown> = {
+          fullName,
+          gender,
+          parentName,
+          email: normalizedEmail,
+          contact,
+          universityId,
+          collegeId,
+          university: selectedUni?.name,
+          college: selectedCollege?.name,
+          degree,
+          department: departmentName,
+          subject,
+          session,
+          semester: classSem,
+          rollNo,
+          course,
+          internship_mode: internshipMode,
+          referral_code: peekStoredReferralCode(),
+        };
+        if (password.length >= 6) payload.password = password;
+
+        await supabase.from("registration_leads").upsert(
+          {
+            email: normalizedEmail,
+            phone: contact,
+            step,
+            payload,
+            cybercafe_shop_name: cyberData.shop_name || null,
+            cybercafe_email: cyberData.email || null,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: "email" }
+        );
+      } catch (e) {
+        console.warn("registration_leads upsert:", e);
+      }
+    }, 900);
+    return () => window.clearTimeout(t);
+  }, [
+    isAdminVariant,
+    step,
+    fullName,
+    gender,
+    parentName,
+    email,
+    contact,
+    universityId,
+    collegeId,
+    degree,
+    departmentName,
+    subject,
+    session,
+    classSem,
+    rollNo,
+    course,
+    internshipMode,
+    password,
+    colleges,
+    unis,
+  ]);
+
+  useEffect(() => {
+    supabase.from("universities").select("*").order("name").then(({ data }) => setUnis(data || []));
+    supabase.from("internship_domains").select("*").order("name").then(({ data }) => setDomains(data || []));
+
+    // Fetch payment config
+    supabase.from("public_payment_config").select("*").maybeSingle().then(({ data }) => {
+      setPaymentSettings(data);
+    });
+
+    if (!isAdminVariant) {
+      captureReferralFromUrl();
+      logReferralClickFromUrl(supabase);
+    }
+
+    // Prefetch Razorpay checkout (actual open still awaits loadRazorpayCheckout in handlePayment).
+    if (!isAdminVariant) {
+      loadRazorpayCheckout().catch(() => {
+        /* non-fatal until user pays */
+      });
+    }
+  }, [isAdminVariant]);
+
+  useEffect(() => {
+    if (!universityId) { setColleges([]); setCollegeId(""); return; }
+    supabase.from("colleges").select("*").eq("university_id", universityId).order("name").then(({ data }) => setColleges(data || []));
+    setCollegeId("");
+  }, [universityId]);
+
+  useEffect(() => {
+    setDepartmentName("");
+    setSubject("");
+  }, [degree]);
+
+  // ── College Roster auto-fill ────────────────────────────────────────────────
+  // When a student picks a college, ask the DB whether their (email, phone)
+  // appears in that college's pre-loaded roster. If yes, fill every academic /
+  // internship field for them and let them skip straight to payment.
+  useEffect(() => {
+    if (isAdminVariant) return;
+    if (!collegeId) {
+      setRosterStatus("idle");
+      setRosterMatchedName("");
+      return;
+    }
+    const normEmail = (email || "").trim().toLowerCase();
+    const normPhone = (contact || "").replace(/\D/g, "");
+    if (!normEmail && normPhone.length < 10) {
+      setRosterStatus("idle");
+      return;
+    }
+
+    let cancelled = false;
+    setRosterStatus("checking");
+    (async () => {
+      const result = await matchCollegeRoster(collegeId, normEmail, normPhone);
+      if (cancelled) return;
+
+      if (result.status === "matched" && result.data) {
+        const d = result.data;
+
+        // Plain-text fields (no normalisation needed).
+        if (d.full_name && !fullName) setFullName(d.full_name);
+        if (d.parent_name && !parentName) setParentName(d.parent_name);
+        if (d.registration_number) setRollNo(d.registration_number);
+        if (d.course) setCourse(d.course);
+
+        // Normalise dropdown / radio values to match the form's exact options.
+        const normGender = normalizeGender(d.gender);
+        if (normGender && !gender) setGender(normGender);
+
+        const normDept =
+          normalizeDepartment(d.department) ||
+          normalizeDepartment(d.degree) ||
+          inferDepartmentFromSubject(d.subject);
+        const normDegree =
+          normalizeDegree(d.degree) ||
+          normalizeDegree(d.department) ||
+          (normDept ? normalizeDegree(normDept) : "");
+
+        if (normDegree) setDegree(normDegree);
+        if (normDept) setDepartmentName(normDept);
+
+        const normSubject = normalizeSubject(d.subject, normDept);
+        if (normSubject) setSubject(normSubject);
+
+        const normSem = normalizeSemester(d.class_semester);
+        if (normSem) setClassSem(normSem);
+
+        const normSession = normalizeSession(d.academic_session);
+        if (normSession) setSession(normSession);
+
+        const normMode = normalizeInternshipMode(d.internship_mode);
+        if (normMode) setInternshipMode(normMode);
+
+        setRosterMatchedName(d.full_name || "");
+        setRosterStatus("matched");
+      } else if (result.status === "claimed") {
+        setRosterStatus("claimed");
+        setRosterAlreadyRegisteredOpen(true);
+      } else if (result.status === "ambiguous") {
+        setRosterStatus("ambiguous");
+      } else {
+        setRosterStatus("none");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // Re-run when the lookup keys change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [collegeId, email, contact, isAdminVariant]);
+
+  const ensureRegistrationIdentityAvailable = async (): Promise<boolean> => {
+    setCheckingRegistration(true);
+    try {
+      const result = await checkStudentRegistrationAvailable(supabase, email, contact);
+      if (!result.available) {
+        setRegistrationFieldError(registrationFieldErrors(result));
+        toast.error(
+          result.message ||
+            "This email or mobile number is already registered. Sign in if you already have an account."
+        );
+        return false;
+      }
+      setRegistrationFieldError({});
+      return true;
+    } finally {
+      setCheckingRegistration(false);
+    }
+  };
+
+  const validateStep = (): boolean => {
+    if (step === 1) {
+      const s = z.object({
+        fullName: z.string().trim().min(2, "Full name is required").max(100),
+        gender: z.string().min(1, "Select gender"),
+        parentName: z.string().trim().min(2, "Parent/Guardian name is required").max(100),
+        contact: z.string().regex(/^[6-9]\d{9}$/, "Enter a valid 10-digit mobile number"),
+        email: z.string().email("Enter a valid email").max(255),
+      }).safeParse({ fullName, gender, parentName, contact, email });
+      if (!s.success) { toast.error(s.error.issues[0].message); return false; }
+    }
+    if (step === 2) {
+      if (!universityId || !collegeId || !degree || !classSem || !session || !rollNo || !course) {
+        toast.error("Please fill all required academic fields"); return false;
+      }
+    }
+    if (step === 3) {
+      const hasAny = emName.trim() || emPhone.trim() || emRel;
+      if (hasAny) {
+        const s = z.object({
+          emName: z.string().trim().min(2).max(100),
+          emPhone: z.string().regex(/^[6-9]\d{9}$/, "Enter a valid 10-digit emergency number"),
+          emRel: z.string().min(1, "Select relationship"),
+        }).safeParse({ emName, emPhone, emRel });
+        if (!s.success) {
+          toast.error(s.error.issues[0].message);
+          return false;
+        }
+      }
+    }
+    if (step === 4) {
+      if (password.length < 6) { toast.error("Password must be at least 6 characters"); return false; }
+      if (password !== confirmPw) { toast.error("Passwords do not match"); return false; }
+      if (!agree) { toast.error("Please accept the Terms & Privacy Policy"); return false; }
+    }
+    if (step === 5 && consentLetterFile) {
+      if (consentLetterFile.size > CONSENT_MAX_BYTES) {
+        toast.error("Consent letter must be 10 MB or smaller.");
+        return false;
+      }
+      if (!isAllowedConsentFile(consentLetterFile)) {
+        toast.error("Use a PDF or image file (PNG, JPEG, WebP, GIF).");
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const next = async () => {
+    if (!validateStep()) return;
+    if (step === 1) {
+      const ok = await ensureRegistrationIdentityAvailable();
+      if (!ok) return;
+    }
+    setStep((s) => {
+      const cap = needsLnmuConsent ? 5 : 4;
+      const candidate = Math.min(cap, s + 1) as Step;
+      // Roster-matched students skip Step 3 (emergency contacts, which are
+      // optional anyway) and land straight on the payment step.
+      if (candidate === 3 && rosterStatus === "matched" && !isAdminVariant) {
+        return 4;
+      }
+      return candidate;
+    });
+  };
+  const back = () =>
+    setStep((s) => {
+      const candidate = Math.max(1, s - 1) as Step;
+      // Mirror the skip on the way back too, so they don't see Step 3.
+      if (candidate === 3 && rosterStatus === "matched" && !isAdminVariant) {
+        return 2;
+      }
+      return candidate;
+    });
+
+  const handlePayment = async () => {
+    if (!paymentSettings?.is_active) return { success: true };
+
+    const identityOk = await ensureRegistrationIdentityAvailable();
+    if (!identityOk) return { success: false };
+
+    const selectedCollege = colleges.find(c => c.id === collegeId);
+    const selectedUni = unis.find(u => u.id === universityId);
+
+    const breakdown = resolveStudentFeeBreakdown(
+      selectedUni?.name,
+      selectedCollege?.name,
+      selectedCollege,
+      selectedUni,
+      paymentSettings?.amount_paise
+    );
+    const finalAmount = breakdown.totalPaise;
+
+    const payResult = await runClientRazorpayCheckout({
+      paymentSettings,
+      amountPaise: finalAmount,
+      prefill: { name: fullName, email: email.trim(), contact },
+    });
+
+    if (!payResult.success) {
+      if (!payResult.cancelled) {
+        toast.error("Payment failed. Please try again.");
+      }
+      return { success: false };
+    }
+
+    return {
+      success: true,
+      payment_id: payResult.payment_id,
+      amount: payResult.amount,
+      mode: "legacy" as const,
+    };
+  };
+
+  const submit = async () => {
+    if (!validateStep()) return;
+    if (isAdminVariant) {
+      await performAdminSubmit();
+      return;
+    }
+    if (needsLnmuConsent && step === 5) {
+      if (consentLetterFile) {
+        setSubmitting(true);
+        try {
+          consentFormUrlRef.current = await uploadConsentLetterToStorage(
+            consentLetterFile,
+            email.trim().toLowerCase()
+          );
+        } catch (e) {
+          toast.error(e instanceof Error ? e.message : "Consent letter upload failed.");
+          setSubmitting(false);
+          return;
+        }
+        setSubmitting(false);
+      } else {
+        consentFormUrlRef.current = null;
+      }
+    }
+    const identityOk = await ensureRegistrationIdentityAvailable();
+    if (!identityOk) return;
+    await performSubmit();
+  };
+
+  const performAdminSubmit = async () => {
+    setSubmitting(true);
+    try {
+      const normalizedEmail = email.trim().toLowerCase();
+      const identityOk = await ensureRegistrationIdentityAvailable();
+      if (!identityOk) return;
+
+      const { data: sessionWrap } = await supabase.auth.getSession();
+      if (!sessionWrap?.session?.user?.id) throw new Error("Your session expired. Please sign in again.");
+
+      const selectedCollege = colleges.find((c) => c.id === collegeId);
+      const selectedUni = unis.find((u) => u.id === universityId);
+
+      const ephemeral = createEphemeralSupabaseAuthClient();
+      const { data: authData, error: authError } = await ephemeral.auth.signUp({
+        email: normalizedEmail,
+        password,
+        options: { data: { full_name: fullName } },
+      });
+
+      if (authError) {
+        const low = authError.message.toLowerCase();
+        if (
+          low.includes("already registered") ||
+          low.includes("already exists") ||
+          authError.code === "user_already_exists"
+        ) {
+          throw new Error(
+            "This email is already registered. Use a different email or find the student in the directory to edit their profile."
+          );
+        }
+        throw authError;
+      }
+
+      const userId = authData.user?.id;
+      if (!userId) {
+        throw new Error(
+          "Signup did not return a user id. In Supabase Auth, turn off email confirmation for signups or confirm the account, then retry."
+        );
+      }
+
+      const { data: latestStudents } = await supabase
+        .from("students")
+        .select("registration_id")
+        .not("registration_id", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(10);
+
+      let nextSeq = 10001;
+      if (latestStudents && latestStudents.length > 0) {
+        const seqs = latestStudents
+          .map((s) => {
+            const parts = s.registration_id.split("/");
+            return parts.length === 4 ? parseInt(parts[3], 10) : 0;
+          })
+          .filter((n) => !isNaN(n));
+        if (seqs.length > 0) nextSeq = Math.max(...seqs) + 1;
+      }
+      const currentYear = new Date().getFullYear();
+      let regId = `EZY/${currentYear}/INT/${nextSeq}`;
+
+      const cyberData = JSON.parse(sessionStorage.getItem("cybercafe_profile") || "{}");
+
+      const basePayload = {
+        id: userId,
+        email: normalizedEmail,
+        full_name: fullName,
+        gender,
+        parent_name: parentName,
+        contact_number: contact,
+        university_name: selectedUni?.name || "",
+        college_name: displayCollegeName(selectedCollege?.name) || "",
+        course,
+        internship_domain: course,
+        degree,
+        department: departmentName,
+        class_semester: classSem,
+        academic_session: session,
+        roll_number: rollNo,
+        emergency_name: emName,
+        emergency_contact: emPhone,
+        emergency_relation: emRel,
+        status: "Active" as const,
+        cybercafe_shop_name: cyberData.shop_name || null,
+        cybercafe_email: cyberData.email || null,
+        metadata: {
+          source: "admin_manual_registration",
+          subject,
+          fullName: fullName,
+          parentName: parentName,
+          gender,
+          contact,
+          university: selectedUni?.name || "",
+          college: selectedCollege?.name || "",
+          degree,
+          department: departmentName,
+          session,
+          semester: classSem,
+          rollNo,
+          course,
+          internship_mode: internshipMode,
+        },
+      };
+
+      const studentDataPayload = withStoredDirectoryPassword(basePayload, password);
+
+      let retryCount = 0;
+      while (retryCount < 10) {
+        studentDataPayload.registration_id = regId;
+        const { error } = await supabase.from("students").upsert(studentDataPayload);
+        if (error) {
+          if (error.code === "23505" && (error.message.includes("registration_id") || error.detail?.includes("registration_id"))) {
+            nextSeq++;
+            regId = `EZY/${currentYear}/INT/${nextSeq}`;
+            retryCount++;
+            continue;
+          }
+          throw error;
+        }
+        break;
+      }
+
+      await adminUpsertStudentProfile(supabase, {
+        id: userId,
+        full_name: fullName,
+        email: normalizedEmail,
+        contact_number: contact,
+        gender,
+        parent_name: parentName,
+      });
+
+      await supabase.from("user_roles").upsert({ user_id: userId, role: "student" }, { onConflict: "user_id,role" });
+
+      await supabase.from("payment_success").insert({
+        user_id: userId,
+        payment_id: `pay_admin_${Date.now()}`,
+        amount_paise: 0,
+        email: normalizedEmail,
+        full_name: fullName,
+        college_name: displayCollegeName(selectedCollege?.name) || "",
+        status: "success",
+      });
+
+      try {
+        const mailRes = await fetch(getSendMailApiUrl(), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            to: normalizedEmail,
+            email: normalizedEmail,
+            action: "registration_success",
+            data: {
+              fullName,
+              regId,
+              password,
+              loginLink: buildStudentCredentialLoginLink(window.location.origin),
+            },
+          }),
+        });
+        await assertSendMailOk(mailRes);
+      } catch {
+        /* optional welcome mail */
+      }
+
+      toast.success("Student added successfully.");
+      onAdminComplete?.({ email: normalizedEmail, full_name: fullName });
+      onSuccess?.();
+    } catch (err: unknown) {
+      toast.error(err instanceof Error ? err.message : "Failed to add student");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const performSubmit = async () => {
+    setSubmitting(true);
+
+    try {
+      let result: any = { success: true };
+      if (paymentSettings?.is_active) {
+        result = await handlePayment();
+        if (!result.success) {
+          setSubmitting(false);
+          return;
+        }
+      }
+
+      const normalizedEmail = email.trim().toLowerCase();
+      let userId: string | undefined;
+      let regId = "";
+
+      const validReferral = await resolveValidReferralCode(supabase, peekStoredReferralCode());
+
+      const isLegacyPaidFlow = paymentSettings?.is_active && result?.mode === "legacy";
+      if (paymentSettings?.is_active && !isLegacyPaidFlow) {
+        // Server verify inserts student row — slight replication lag can yield empty reads.
+        let enrolled: { id: string; registration_id: string | null } | null = null;
+        for (let attempt = 0; attempt < 12; attempt++) {
+          const { data } = await supabase
+            .from("students")
+            .select("id, registration_id")
+            .eq("email", normalizedEmail)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (data?.id) {
+            enrolled = data;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 450));
+        }
+        userId = enrolled?.id;
+        regId = enrolled?.registration_id || "";
+        if (!userId) throw new Error("Payment captured but enrollment not completed. Please contact support.");
+        if (validReferral && userId) {
+          const { error: refErr } = await supabase
+            .from("students")
+            .update({ referral_code: validReferral })
+            .eq("id", userId);
+          if (refErr) console.warn("referral_code update (verified payment):", refErr);
+        }
+      } else {
+        const authClient =
+          isCyberCafeVariant || isAdminVariant
+            ? createEphemeralSupabaseAuthClient()
+            : supabase;
+        const { data, error: authError } = await authClient.auth.signUp({
+          email: normalizedEmail, password,
+          options: { data: { full_name: fullName } },
+        });
+
+        if (authError) {
+          const low = authError.message.toLowerCase();
+          if (
+            low.includes("already registered") ||
+            low.includes("already exists") ||
+            authError.code === "user_already_exists"
+          ) {
+            throw new Error(
+              "This email is already registered. Sign in with this email or use a different email address."
+            );
+          }
+          throw authError;
+        }
+        userId = data.user?.id;
+        if (!userId) throw new Error("Signup failed");
+
+        // Robust Registration ID Logic
+        const { data: latestStudents } = await supabase
+          .from("students")
+          .select("registration_id")
+          .not("registration_id", "is", null)
+          .order("created_at", { ascending: false })
+          .limit(10);
+
+        let nextSeq = 10001;
+        if (latestStudents && latestStudents.length > 0) {
+          const seqs = latestStudents.map(s => {
+            const parts = s.registration_id.split('/');
+            return parts.length === 4 ? parseInt(parts[3], 10) : 0;
+          }).filter(n => !isNaN(n));
+          if (seqs.length > 0) nextSeq = Math.max(...seqs) + 1;
+        }
+        const currentYear = new Date().getFullYear();
+        regId = `EZY/${currentYear}/INT/${nextSeq}`;
+
+        const cyberData = JSON.parse(sessionStorage.getItem('cybercafe_profile') || '{}');
+        const selectedUniName = unis.find((u) => u.id === universityId)?.name || "";
+        const meta: Record<string, unknown> = { subject, internship_mode: internshipMode };
+        if (isLnmuStudent(selectedUniName) && consentFormUrlRef.current) {
+          meta.consent_form_url = consentFormUrlRef.current;
+        }
+        const studentData: any = withStoredDirectoryPassword(
+          {
+            id: userId,
+            email: normalizedEmail,
+            full_name: fullName,
+            gender,
+            parent_name: parentName,
+            contact_number: contact,
+            university_name: selectedUniName,
+            college_name: displayCollegeName(colleges.find(c => c.id === collegeId)?.name) || "",
+            course,
+            internship_domain: course,
+            degree,
+            department: departmentName,
+            class_semester: classSem,
+            academic_session: session,
+            roll_number: rollNo,
+            emergency_name: emName,
+            emergency_contact: emPhone,
+            emergency_relation: emRel,
+            status: 'Active',
+            cybercafe_shop_name: cyberData.shop_name || null,
+            cybercafe_email: cyberData.email || null,
+            referral_code: validReferral,
+            metadata: meta,
+          },
+          password
+        );
+
+        let retryCount = 0;
+        while (retryCount < 10) {
+          studentData.registration_id = regId;
+          const { error } = await supabase.from("students").insert(studentData);
+          if (error) {
+            if (error.code === '23505' && error.message.includes('registration_id')) {
+              nextSeq++;
+              regId = `EZY/${currentYear}/INT/${nextSeq}`;
+              retryCount++;
+              continue;
+            }
+            throw error;
+          }
+          break;
+        }
+
+        await supabase.from("profiles").upsert({
+          id: userId, full_name: fullName, email: normalizedEmail, contact_number: contact, gender, parent_name: parentName
+        });
+
+        if (paymentSettings?.is_active && result?.payment_id) {
+          await supabase.from("payment_success").insert({
+            user_id: userId,
+            payment_id: result.payment_id,
+            amount_paise: result.amount,
+            email: normalizedEmail,
+            full_name: fullName,
+            college_name: displayCollegeName(colleges.find(c => c.id === collegeId)?.name),
+            cybercafe_shop_name: JSON.parse(sessionStorage.getItem('cybercafe_profile') || '{}').shop_name || null,
+            cybercafe_email: JSON.parse(sessionStorage.getItem('cybercafe_profile') || '{}').email || null,
+            status: 'success'
+          });
+        }
+      }
+
+      // Try sending mail
+      try {
+        await fetch(getSendMailApiUrl(), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            to: normalizedEmail,
+            email: normalizedEmail,
+            action: 'registration_confirmation',
+            data: { fullName, regId, password, loginLink: buildStudentCredentialLoginLink(window.location.origin) },
+          })
+        });
+      } catch (e) {}
+
+      try {
+        await supabase.from("registration_leads").delete().eq("email", normalizedEmail);
+      } catch (_e) {
+        /* ignore */
+      }
+
+      setSuccess(true);
+      toast.success(
+        isCyberCafeVariant
+          ? "Student registered. Credentials sent to their email."
+          : "Registration complete!"
+      );
+      onSuccess?.();
+
+      if (!isCyberCafeVariant && !isAdminVariant) {
+        let hasSession = !!((await supabase.auth.getSession()).data.session);
+        if (!hasSession) {
+          for (let i = 0; i < 4 && !hasSession; i++) {
+            const { error: signInError } = await supabase.auth.signInWithPassword({
+              email: normalizedEmail,
+              password,
+            });
+            if (!signInError) hasSession = true;
+            else await new Promise((r) => setTimeout(r, 350));
+          }
+        }
+        if (hasSession) {
+          navigate("/dashboard");
+        } else {
+          toast.info("Your account is created. Please login to continue.");
+        }
+      }
+    } catch (err: any) {
+      toast.error(err.message || "Registration failed");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  if (success) {
+    return (
+      <div className="p-8 text-center animate-fade-in">
+        <div className="inline-flex size-16 items-center justify-center rounded-full bg-primary/10 mb-4">
+          <CheckCircle2 className="size-9 text-primary" />
+        </div>
+        <h2 className="text-2xl font-bold mb-2">Success!</h2>
+        {isCyberCafeVariant ? (
+          <>
+            <p className="text-muted-foreground mb-2">Student added to the directory.</p>
+            <p className="text-sm text-muted-foreground mb-6">
+              Login credentials were sent to the student&apos;s email. You can register the next student now.
+            </p>
+            <Button className="w-full" onClick={() => onRegisterAnother?.()}>
+              Register another student
+            </Button>
+          </>
+        ) : (
+          <>
+            <p className="text-muted-foreground mb-6">Student registered successfully.</p>
+            <Button className="w-full" onClick={() => window.location.reload()}>Finish</Button>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  const maxProgressStep = needsLnmuConsent ? 5 : 4;
+  const progress = (step / maxProgressStep) * 100;
+  const stepLabels = needsLnmuConsent
+    ? (["Personal", "Academic", "Emergency", "Security", "Consent letter"] as const)
+    : (["Personal", "Academic", "Emergency", "Security"] as const);
+
+  return (
+    <div className="max-w-2xl mx-auto p-2">
+      <div className="mb-6">
+        <Progress value={progress} className="h-2 mb-3" />
+        <div className="flex justify-between text-[10px] sm:text-xs">
+          {stepLabels.map((l, i) => (
+            <div key={l} className={`flex items-center gap-1 ${step >= i + 1 ? "text-primary font-semibold" : "text-muted-foreground"}`}>
+              <span className={`flex size-4 items-center justify-center rounded-full text-[9px] ${step > i + 1 ? "bg-primary text-primary-foreground" : step === i + 1 ? "bg-primary/15 border border-primary text-primary" : "bg-muted text-muted-foreground"}`}>{step > i + 1 ? "✓" : i + 1}</span>
+              <span>{l}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {step === 1 && (
+        <div className="space-y-4 animate-fade-in">
+          <div className="grid sm:grid-cols-2 gap-4">
+            <div className="space-y-1.5"><Label className="text-xs">Full Name *</Label><Input value={fullName} onChange={(e) => setFullName(e.target.value)} bsSize="sm" /></div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Gender *</Label>
+              <RadioGroup value={gender} onValueChange={setGender} className="flex gap-4 pt-1">
+                {["Male", "Female"].map((g) => (
+                  <label key={g} className="flex items-center gap-1.5 cursor-pointer text-xs">
+                    <RadioGroupItem value={g} id={`g-${g}`} /><span className="text-xs">{g}</span>
+                  </label>
+                ))}
+              </RadioGroup>
+            </div>
+            <div className="space-y-1.5"><Label className="text-xs">Parent Name *</Label><Input value={parentName} onChange={(e) => setParentName(e.target.value)} /></div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Contact Number *</Label>
+              <Input
+                value={contact}
+                onChange={(e) => {
+                  setContact(e.target.value.replace(/\D/g, "").slice(0, 10));
+                  setRegistrationFieldError((prev) => ({ ...prev, phone: undefined }));
+                }}
+                className={registrationFieldError.phone ? "border-destructive" : undefined}
+              />
+              {registrationFieldError.phone && (
+                <p className="text-[11px] text-destructive font-medium">{registrationFieldError.phone}</p>
+              )}
+            </div>
+            <div className="sm:col-span-2 space-y-1.5">
+              <Label className="text-xs">Email Address *</Label>
+              <Input
+                type="email"
+                value={email}
+                onChange={(e) => {
+                  setEmail(e.target.value);
+                  setRegistrationFieldError((prev) => ({ ...prev, email: undefined }));
+                }}
+                className={registrationFieldError.email ? "border-destructive" : undefined}
+              />
+              {registrationFieldError.email && (
+                <p className="text-[11px] text-destructive font-medium">{registrationFieldError.email}</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {step === 2 && (
+        <div className="space-y-4 animate-fade-in">
+          {rosterStatus === "checking" && (
+            <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/40 border rounded-lg px-3 py-2">
+              <Loader2 className="size-3.5 animate-spin" />
+              Checking your college's enrolment list…
+            </div>
+          )}
+          {rosterStatus === "matched" && (
+            <div className="rounded-xl border-2 border-emerald-500/40 bg-emerald-50 text-emerald-900 p-4 flex items-start gap-3">
+              <CheckCircle2 className="size-5 mt-0.5 text-emerald-600 shrink-0" />
+              <div className="flex-1">
+                <p className="font-black text-sm">
+                  Great — we found{rosterMatchedName ? ` ${rosterMatchedName.split(" ")[0]}` : " your record"} in the college roster.
+                </p>
+                <p className="text-xs mt-1">
+                  All academic details are pre-filled below. You can continue straight to payment — no need to fill the emergency-contact step.
+                </p>
+              </div>
+            </div>
+          )}
+          {rosterStatus === "ambiguous" && (
+            <div className="rounded-xl border-2 border-amber-500/40 bg-amber-50 text-amber-900 p-4 text-xs">
+              Multiple records matched in the college roster. Please continue and fill the details manually — your registration number will help us reconcile.
+            </div>
+          )}
+          <div className="grid sm:grid-cols-2 gap-3">
+            <div className="space-y-1"><Label className="text-xs">University *</Label>
+              <Select value={universityId} onValueChange={setUniversityId}>
+                <SelectTrigger className="h-9 text-xs"><SelectValue placeholder="Select university" /></SelectTrigger>
+                <SelectContent>{unis.map((u) => (<SelectItem key={u.id} value={u.id}>{u.name}</SelectItem>))}</SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1"><Label className="text-xs">College *</Label>
+              <Select value={collegeId} onValueChange={setCollegeId} disabled={!universityId}>
+                <SelectTrigger className="h-9 text-xs"><SelectValue placeholder="Select college" /></SelectTrigger>
+                <SelectContent>{colleges.map((c) => (<SelectItem key={c.id} value={c.id}>{displayCollegeName(c.name)}</SelectItem>))}</SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1"><Label className="text-xs">Degree *</Label>
+              <RadioGroup value={degree} onValueChange={setDegree} className="flex gap-4 pt-1">
+                {["UG", "PG"].map((d) => (<label key={d} className="flex items-center gap-1.5 cursor-pointer text-xs"><RadioGroupItem value={d} id={`d-${d}`} />{d}</label>))}
+              </RadioGroup>
+            </div>
+            <div className="space-y-1"><Label className="text-xs">Department *</Label>
+              <Select value={departmentName} onValueChange={(val) => { setDepartmentName(val); setSubject(""); setCourse(""); }} disabled={!degree}>
+                <SelectTrigger className="h-9 text-xs"><SelectValue placeholder="Select dept" /></SelectTrigger>
+                <SelectContent>
+                  {degree === "UG" ? (<><SelectItem value="B.A.">B.A.</SelectItem><SelectItem value="B.Sc">B.Sc</SelectItem><SelectItem value="B.Com">B.Com</SelectItem></>) : (<><SelectItem value="M.A.">M.A.</SelectItem><SelectItem value="M.Sc">M.Sc</SelectItem><SelectItem value="M.Com">M.Com</SelectItem></>)}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1"><Label className="text-xs">Subject</Label>
+              {departmentName?.includes(".") ? (
+                <Select value={subject} onValueChange={(val) => { setSubject(val); setCourse(""); }}>
+                  <SelectTrigger className="h-9 text-xs"><SelectValue placeholder="Subject" /></SelectTrigger>
+                  <SelectContent>
+                    {departmentName === "B.A." && baSubjects.map(s => <SelectItem key={s} value={s}>{s}</SelectItem>)}
+                    {departmentName === "B.Sc" && bscSubjects.map(s => <SelectItem key={s} value={s}>{s}</SelectItem>)}
+                    {departmentName === "B.Com" && bcomSubjects.map(s => <SelectItem key={s} value={s}>{s}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <Input className="h-9 text-xs" value={subject} onChange={(e) => setSubject(e.target.value)} />
+              )}
+            </div>
+            <div className="space-y-1"><Label className="text-xs">Session *</Label>
+              <Select value={session} onValueChange={setSession}><SelectTrigger className="h-9 text-xs"><SelectValue placeholder="Session" /></SelectTrigger><SelectContent>{["2023-2027", "2024-2028", "2025-2029"].map(s => (<SelectItem key={s} value={s}>{s}</SelectItem>))}</SelectContent></Select>
+            </div>
+            <div className="space-y-1"><Label className="text-xs">Semester *</Label>
+              <Select value={classSem} onValueChange={setClassSem}><SelectTrigger className="h-9 text-xs"><SelectValue placeholder="Semester" /></SelectTrigger><SelectContent>{[1, 2, 3, 4, 5, 6, 7, 8].map(s => (<SelectItem key={s} value={`Semester ${s}`}>Sem {s}</SelectItem>))}</SelectContent></Select>
+            </div>
+            <div className="space-y-1"><Label className="text-xs">Registration number *</Label><Input value={rollNo} onChange={(e) => setRollNo(e.target.value)} /></div>
+            <div className="space-y-1"><Label className="text-xs">Internship domain *</Label>
+              <Select value={course} onValueChange={setCourse} disabled={!subject && !!departmentName?.includes(".")}>
+                <SelectTrigger className="h-9 text-xs"><SelectValue placeholder={subject ? "Select domain" : "Select subject first"} /></SelectTrigger>
+                <SelectContent>{domainOptions.map((name) => (<SelectItem key={name} value={name}>{name}</SelectItem>))}</SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1"><Label className="text-xs">Mode *</Label>
+              <Select value={internshipMode} onValueChange={setInternshipMode}>
+                <SelectTrigger className="h-9 text-xs"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="Online">Online</SelectItem>
+                  <SelectItem value="Offline">Offline</SelectItem>
+                  <SelectItem value="Hybrid">Hybrid</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {step === 3 && (
+        <div className="space-y-4 animate-fade-in">
+          <p className="text-[11px] text-muted-foreground">Emergency details are optional. If you fill any field, complete all three.</p>
+          <div className="grid sm:grid-cols-2 gap-4">
+            <div className="space-y-1.5"><Label className="text-xs">Emergency contact person name</Label><Input value={emName} onChange={(e) => setEmName(e.target.value)} /></div>
+            <div className="space-y-1.5"><Label className="text-xs">Emergency contact number</Label><Input value={emPhone} onChange={(e) => setEmPhone(e.target.value.replace(/\D/g, "").slice(0, 10))} placeholder="10-digit mobile" /></div>
+            <div className="sm:col-span-2 space-y-1.5"><Label className="text-xs">Relationship</Label><Select value={emRel} onValueChange={setEmRel}><SelectTrigger className="h-9 text-xs"><SelectValue placeholder="Optional" /></SelectTrigger><SelectContent>{["Father", "Mother", "Guardian", "Other"].map((r) => (<SelectItem key={r} value={r}>{r}</SelectItem>))}</SelectContent></Select></div>
+          </div>
+        </div>
+      )}
+
+      {step === 5 && needsLnmuConsent && (
+        <div className="space-y-4 animate-fade-in">
+          <div className="rounded-xl border-2 border-primary/20 bg-muted/30 p-4 space-y-3">
+            <div className="flex items-start gap-2">
+              <FileText className="size-5 text-primary shrink-0 mt-0.5" />
+              <div>
+                <p className="text-sm font-bold text-foreground">Consent letter</p>
+                <p className="text-[11px] text-muted-foreground mt-1 leading-snug">
+                  Optional. Accepted formats: PDF, PNG, JPEG, WebP, or GIF (max 10 MB).
+                </p>
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Consent letter</Label>
+              <label className="flex flex-col sm:flex-row sm:items-center gap-2 cursor-pointer">
+                <Input
+                  type="file"
+                  accept=".pdf,application/pdf,image/png,image/jpeg,image/webp,image/gif"
+                  className="h-9 text-xs cursor-pointer"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    setConsentLetterFile(f ?? null);
+                  }}
+                />
+                {consentLetterFile && (
+                  <span className="text-[10px] text-muted-foreground truncate">{consentLetterFile.name}</span>
+                )}
+              </label>
+            </div>
+            <p className="text-[10px] text-muted-foreground flex items-center gap-1.5">
+              <Upload className="size-3.5 shrink-0" />
+              You can skip this upload and continue to payment.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {step === 4 && (
+        <div className="space-y-4 animate-fade-in">
+          <div className="grid sm:grid-cols-2 gap-4">
+            <div className="space-y-1.5"><Label className="text-xs">Password *</Label>
+              <div className="relative">
+                <Input type={showPw ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)} />
+                <button type="button" onClick={() => setShowPw(!showPw)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground">{showPw ? <EyeOff className="size-4" /> : <Eye className="size-4" />}</button>
+              </div>
+            </div>
+            <div className="space-y-1.5"><Label className="text-xs">Confirm Password *</Label><Input type={showPw ? "text" : "password"} value={confirmPw} onChange={(e) => setConfirmPw(e.target.value)} /></div>
+          </div>
+
+          {!isAdminVariant && paymentSettings?.is_active && (() => {
+            const sCollege = colleges.find((c) => c.id === collegeId);
+            const sUni = unis.find((u) => u.id === universityId);
+            const fee = resolveStudentFeeBreakdown(
+              sUni?.name,
+              sCollege?.name,
+              sCollege,
+              sUni,
+              paymentSettings?.amount_paise
+            );
+            return (
+              <div className="rounded-xl border-2 border-primary/25 bg-primary/[0.04] p-4 sm:p-5 space-y-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-[11px] font-black uppercase tracking-widest text-primary">
+                    Payment Summary
+                  </p>
+                </div>
+                {fee.hasBreakdown && fee.componentLineLabels && (
+                  <div className="space-y-1 text-sm mb-2">
+                    <div className="flex justify-between text-muted-foreground">
+                      <span>{fee.componentLineLabels.base}</span>
+                      <span className="font-medium text-foreground">{formatRupees(fee.basePaise)}</span>
+                    </div>
+                    <div className="flex justify-between text-muted-foreground">
+                      <span>{fee.componentLineLabels.gst}</span>
+                      <span className="font-medium text-foreground">{formatRupees(fee.gstPaise)}</span>
+                    </div>
+                  </div>
+                )}
+                <div className="flex items-center justify-between border-t border-primary/15 pt-2">
+                  <span className="font-bold text-foreground">Total payable</span>
+                  <span className="font-black text-xl text-primary">
+                    {formatRupees(fee.totalPaise)}
+                  </span>
+                </div>
+              </div>
+            );
+          })()}
+
+          <label className="flex items-start gap-2 cursor-pointer p-3 rounded-lg bg-muted/50 border">
+            <Checkbox checked={agree} onCheckedChange={(v) => setAgree(!!v)} className="mt-1" />
+            <span className="text-[10px] text-muted-foreground leading-tight">I agree to the Terms & Privacy Policy and internship terms.</span>
+          </label>
+        </div>
+      )}
+
+      <div className="flex items-center justify-between mt-8 pt-4 border-t">
+        <Button variant="ghost" size="sm" onClick={back} disabled={step === 1}><ChevronLeft className="size-4 mr-1" /> Back</Button>
+        {step < 4 || (step === 4 && needsLnmuConsent) ? (
+          <Button size="sm" onClick={() => void next()} disabled={checkingRegistration}>
+            {checkingRegistration ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <>
+                Next <ChevronRight className="size-4 ml-1" />
+              </>
+            )}
+          </Button>
+        ) : (
+          <Button size="sm" variant="hero" onClick={submit} disabled={submitting}>
+            {submitting && <Loader2 className="size-4 animate-spin mr-2" />}
+            {isAdminVariant ? "Create student (no payment)" : "Complete Registration"}
+          </Button>
+        )}
+      </div>
+
+      {!isAdminVariant && (
+        <div className="mt-5 rounded-lg border-2 border-emerald-600/30 bg-emerald-50/95 dark:bg-emerald-950/40 dark:border-emerald-700/50 p-3 sm:p-4 space-y-3 shadow-sm">
+          <p className="text-xs sm:text-sm font-bold text-emerald-950 dark:text-emerald-50 text-center sm:text-left leading-snug">
+            Call us:{" "}
+            <a
+              href={`tel:${REGISTRATION_HELP_PHONE_E164.replace(/\s/g, "")}`}
+              className="underline decoration-emerald-700 underline-offset-2 font-bold text-emerald-900 dark:text-emerald-100 hover:text-emerald-700"
+            >
+              {REGISTRATION_HELP_PHONE_DISPLAY}
+            </a>
+          </p>
+          <p className="text-[11px] text-emerald-900/90 dark:text-emerald-200/90 font-semibold text-center sm:text-left leading-snug">
+            Updates, deadlines & certificate info — join our WhatsApp channel for alerts.
+          </p>
+          <Button
+            asChild
+            size="lg"
+            className="w-full font-bold bg-[#25D366] hover:bg-[#20bd5a] text-white border-0 shadow-md h-11 text-sm sm:text-base"
+          >
+            <a href={REGISTRATION_HELP_WHATSAPP_URL} target="_blank" rel="noopener noreferrer">
+              <MessageSquare className="size-4 mr-2 shrink-0" aria-hidden />
+              Join WhatsApp channel
+            </a>
+          </Button>
+          <p className="text-[10px] text-emerald-900/85 dark:text-emerald-200/90 font-semibold text-center border-t border-emerald-600/20 pt-3">
+            Instant support & important alerts — internship से जुड़ी मदद और updates के लिए।
+          </p>
+        </div>
+      )}
+
+
+      <Dialog open={rosterAlreadyRegisteredOpen} onOpenChange={setRosterAlreadyRegisteredOpen}>
+        <DialogContent className="max-w-[95vw] sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-primary font-bold">
+              <Info className="size-5" /> This enrolment is already registered
+            </DialogTitle>
+            <DialogDescription>
+              We found a matching record in your college's enrolment list, but it has already
+              been registered. Please sign in with your existing account instead.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setRosterAlreadyRegisteredOpen(false)}
+            >
+              Keep filling
+            </Button>
+            <Button
+              variant="hero"
+              onClick={() => {
+                setRosterAlreadyRegisteredOpen(false);
+                navigate("/login");
+              }}
+            >
+              Go to login
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+};

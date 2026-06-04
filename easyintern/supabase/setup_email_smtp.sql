@@ -1,0 +1,45 @@
+-- ============================================
+-- SUPABASE SMTP CONFIGURATION GUIDE
+-- ============================================
+-- Run these steps in Supabase Dashboard:
+--
+-- 1. Go to: Authentication → Settings → SMTP Provider
+-- 2. Enable Custom SMTP
+-- 3. Fill in:
+--    Host:        smtp.hostinger.com
+--    Port:        465
+--    Username:    noreply@ezyintern.in
+--    Password:    [your email password]
+--    Sender Name: EzyIntern
+--    Sender Email: noreply@ezyintern.in
+--
+-- 4. Go to: Authentication → Email Templates
+--    → Customize OTP / Magic Link templates with EzyIntern branding
+--
+-- ============================================
+-- EDGE FUNCTION SECRETS (run in terminal)
+-- ============================================
+-- After deploying your edge function, set secrets:
+--
+--   npx supabase secrets set SMTP_USER=noreply@ezyintern.in
+--   npx supabase secrets set SMTP_PASS=your_password_here
+--   npx supabase secrets set SMTP_HOST=smtp.hostinger.com
+--   npx supabase secrets set SMTP_PORT=465
+--
+-- ============================================
+-- DEPLOY EDGE FUNCTION (run in terminal)
+-- ============================================
+--
+--   npx supabase functions deploy send-email --no-verify-jwt
+--
+-- ============================================
+-- OTP Login: Enable Magic Link in Supabase
+-- ============================================
+-- 1. Go to: Authentication → Settings
+-- 2. Under "Auth Providers" → Email
+-- 3. Enable "Email OTP" or "Magic Link"
+-- 4. Set OTP expiry to 600 seconds (10 mins)
+-- 5. All OTPs will now come from noreply@ezyintern.in
+--    (after SMTP is configured above)
+--
+-- ============================================

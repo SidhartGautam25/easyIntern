@@ -1,0 +1,12 @@
+{
+  "redirects": [
+    {
+      "source": "/cyber-cafe/login",
+      "destination": "/cybercafe/login",
+      "permanent": true
+    }
+  ],
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}

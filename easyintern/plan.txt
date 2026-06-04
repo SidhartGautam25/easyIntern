@@ -1,0 +1,17 @@
+. High-Traffic & Horizontal Scaling (~10k/day)
+Stateless Koa Application: The backend instances hold no local state or session data. All coordination, rate-limiting, job queueing, and distributed locks are managed via a centralized Redis instance/cluster. This allows you to scale up the number of Koa server instances dynamically behind a Load Balancer.
+Connection Pooling: Uses structured pooling (via pg-pool or a database proxy) to manage connections to Supabase PostgreSQL, avoiding database socket exhaustion during peak traffic.
+2. Standard Layered Structure (TypeScript Type-Safe)
+Located in updatedeasy/server, the application uses TypeScript interfaces to achieve decoupling:
+
+Controllers: Receive the Koa context, validate incoming payloads using Zod schemas, call the appropriate services, and output clean responses.
+Services: Contain pure business logic (pricing, registration eligibility, signature verification, queue scheduling). They do not know about Koa, HTTP status codes, or raw SQL queries.
+Repositories: Abstract the database actions. We define interface contracts (e.g. IStudentRepository, IPaymentRepository). If you decide to transition away from Supabase in the future, you will only need to write new repository implementations (e.g. using Prisma, Knex, or direct PostgreSQL connections) that implement these interfaces. The Service layer remains completely untouched.
+3. Payment Concurrency & System Reliability (Zero Downtime)
+Distributed Locking (Redlock): A critical layer utilizing Redis locks (lock:payment:order_id) to ensure that if a webhook call and a frontend client verification arrive simultaneously, they are serialized. This prevents duplicate registration attempts and schema failures.
+Queue-Driven Fulfilling (BullMQ):
+The API server handles the lightweight check: validating the Razorpay payment signature and checking the queue status.
+The heavy tasks (registering the user in Auth, updating students, profiles, claiming college rosters, writing payment_success logs, and sending confirmation emails) are wrapped inside a BullMQ job.
+A pool of workers handles the queue. If your mail server slows down or the database encounters a deadlock, the worker retries the job using exponential backoff, ensuring no paid registrations are ever lost.
+4. Zero Schema Changes
+The backend repositories interact with the existing Supabase schemas (students, profiles, payment_success, payment_orders) exactly as they are currently structured, eliminating the need to execute database migrations or data transformations.
