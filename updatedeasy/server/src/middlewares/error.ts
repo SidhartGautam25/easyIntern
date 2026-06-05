@@ -1,26 +1,25 @@
 import { Middleware } from 'koa';
-import crypto from 'crypto';
-import { logger } from '../utils/logger.js';
+import { categorizeError, logger, withErrorCategory } from '../utils/logger.js';
 
 export const errorMiddleware: Middleware = async (ctx, next) => {
-  const correlationId = ctx.headers['x-correlation-id'] || crypto.randomUUID();
-  ctx.state.correlationId = correlationId;
-
   try {
     await next();
   } catch (err: any) {
     const status = err.status || err.statusCode || 500;
     const message = status === 500 ? 'Internal Server Error' : err.message;
+    const requestId = ctx.state.requestId;
+    const traceId = ctx.state.traceId;
+    const errorCategory = categorizeError(err, ctx.path);
 
     logger.error(
-      {
-        correlationId,
+      withErrorCategory(errorCategory, {
+        error: err,
+        requestId,
+        traceId,
         status,
-        message: err.message,
-        stack: err.stack,
-        url: ctx.url,
+        path: ctx.path,
         method: ctx.method,
-      },
+      }),
       'Request failed'
     );
 
@@ -28,7 +27,8 @@ export const errorMiddleware: Middleware = async (ctx, next) => {
     ctx.body = {
       success: false,
       message,
-      correlationId,
+      requestId,
+      traceId,
       ...(process.env.NODE_ENV === 'development' ? { details: err.message, stack: err.stack } : {}),
     };
   }

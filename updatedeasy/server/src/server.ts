@@ -10,13 +10,13 @@ const PORT = config.port;
 
 function startServer() {
   server.listen(PORT, () => {
-    logger.info(`🚀 EzyIntern Koa Backend Server is running on port ${PORT} in ${config.nodeEnv} mode`);
+    logger.info({ port: PORT, nodeEnv: config.nodeEnv }, 'EzyIntern Koa Backend Server started');
   });
 }
 
 // Graceful Shutdown Handlers
 async function gracefulShutdown(signal: string) {
-  logger.info(`Received ${signal}. Starting graceful shutdown...`);
+  logger.info({ signal }, 'Starting graceful shutdown');
 
   // Stop accepting new HTTP requests
   server.close(() => {
@@ -37,7 +37,7 @@ async function gracefulShutdown(signal: string) {
     logger.info('Graceful shutdown completed successfully. Exiting.');
     process.exit(0);
   } catch (err: any) {
-    logger.error({ err: err.message }, 'Error occurred during graceful shutdown');
+    logger.error({ error: err }, 'Error occurred during graceful shutdown');
     process.exit(1);
   }
 }
@@ -48,11 +48,11 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // Catch unhandled promise rejections and exceptions
 process.on('unhandledRejection', (reason: any, _promise) => {
-  logger.fatal({ reason: reason?.message || reason, stack: reason?.stack }, 'Unhandled Promise Rejection');
+  logger.fatal({ error: reason }, 'Unhandled Promise Rejection');
 });
 
 process.on('uncaughtException', (err) => {
-  logger.fatal({ err: err.message, stack: err.stack }, 'Uncaught Exception');
+  logger.fatal({ error: err }, 'Uncaught Exception');
   gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
 

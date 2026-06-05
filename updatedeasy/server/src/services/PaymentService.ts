@@ -8,7 +8,7 @@ import { ICollegeRepository } from '../repositories/interfaces/ICollegeRepositor
 import { IStudentRepository } from '../repositories/interfaces/IStudentRepository.js';
 import { queueService } from './QueueService.js';
 import { config } from '../config/index.js';
-import { logger } from '../utils/logger.js';
+import { audit, logger, withErrorCategory } from '../utils/logger.js';
 
 export class PaymentService {
   private paymentRepo: IPaymentRepository;
@@ -32,7 +32,7 @@ export class PaymentService {
     });
 
     this.redisClient.on('error', (err: any) => {
-      logger.error({ err: err.message }, 'Redis connection error in PaymentService');
+      logger.error(withErrorCategory('redis', { error: err }), 'Redis connection error in PaymentService');
     });
 
     // Initialize Redlock
@@ -46,10 +46,10 @@ export class PaymentService {
       });
 
       this.redlock.on('clientError', (err: any) => {
-        logger.error({ err: err.message }, 'Redlock client error');
+        logger.error(withErrorCategory('redis', { error: err }), 'Redlock client error');
       });
     } catch (err: any) {
-      logger.error({ err: err.message }, 'Failed to initialize Redlock');
+      logger.error(withErrorCategory('redis', { error: err }), 'Failed to initialize Redlock');
     }
   }
 
@@ -119,6 +119,14 @@ export class PaymentService {
     const redisKey = `reg_temp:${rzpOrder.id}`;
     await this.redisClient.set(redisKey, JSON.stringify(studentData), 'EX', 3600);
 
+    audit({
+      action: 'payment.registration_order_created',
+      actorEmail: email.trim().toLowerCase(),
+      targetId: rzpOrder.id,
+      outcome: 'success',
+      amountPaise,
+      currency: rzpOrder.currency,
+    });
     logger.info({ orderId: rzpOrder.id, email }, 'Razorpay order created and cached in Redis');
 
     return {
@@ -141,10 +149,22 @@ export class PaymentService {
       .digest('hex');
 
     if (generatedSig !== clientSignature) {
-      logger.warn({ orderId, paymentId, clientSignature, generatedSig }, 'Invalid client payment signature');
+      logger.warn(withErrorCategory('payment', { orderId, paymentId, clientSignature, generatedSig }), 'Invalid client payment signature');
+      audit({
+        action: 'payment.client_signature_verified',
+        targetId: orderId,
+        outcome: 'failure',
+        paymentId,
+      });
       throw new Error('Invalid signature. Verification failed.');
     }
 
+    audit({
+      action: 'payment.client_signature_verified',
+      targetId: orderId,
+      outcome: 'success',
+      paymentId,
+    });
     logger.info({ orderId, paymentId }, 'Signature verification matches');
 
     // Lock resource using Redlock
@@ -154,7 +174,7 @@ export class PaymentService {
       try {
         lock = await this.redlock.acquire([lockKey], 10000); // 10s lease
       } catch (err: any) {
-        logger.warn({ err: err.message, orderId }, 'Lock collision or failed lock acquisition');
+        logger.warn(withErrorCategory('payment', { error: err, orderId }), 'Lock collision or failed lock acquisition');
         throw new Error('Payment processing in progress. Please check status later.');
       }
     }
@@ -177,10 +197,16 @@ export class PaymentService {
         signature: clientSignature,
       });
 
+      audit({
+        action: 'payment.enrollment_queued',
+        targetId: orderId,
+        outcome: 'success',
+        paymentId,
+      });
       return { success: true, message: 'Payment verified. Enrollment is in progress.' };
     } finally {
       if (lock) {
-        await lock.release().catch((e: any) => logger.error({ err: e.message }, 'Failed to release lock'));
+        await lock.release().catch((e: any) => logger.error(withErrorCategory('payment', { error: e }), 'Failed to release lock'));
       }
     }
   }
@@ -188,7 +214,7 @@ export class PaymentService {
   async processWebhook(bodyString: string, signatureHeader: string) {
     const { webhookSecret } = await this.getRazorpayInstance();
     if (!webhookSecret) {
-      logger.warn('Webhook secret is not configured. Webhook ignored.');
+      logger.warn(withErrorCategory('payment'), 'Webhook secret is not configured. Webhook ignored.');
       throw new Error('Webhook configuration missing.');
     }
 
@@ -199,12 +225,22 @@ export class PaymentService {
       .digest('hex');
 
     if (expectedSig !== signatureHeader) {
-      logger.warn({ expectedSig, signatureHeader }, 'Razorpay Webhook signature mismatch');
+      logger.warn(withErrorCategory('payment', { expectedSig, signatureHeader }), 'Razorpay Webhook signature mismatch');
+      audit({
+        action: 'payment.webhook_verified',
+        outcome: 'failure',
+      });
       throw new Error('Invalid webhook signature');
     }
 
     const payload = JSON.parse(bodyString);
     const event = payload.event;
+    audit({
+      action: 'payment.webhook_verified',
+      targetId: payload.id,
+      outcome: 'success',
+      eventName: event,
+    });
     logger.info({ event, id: payload.id }, 'Received verified Razorpay webhook event');
 
     if (event === 'payment.captured' || event === 'order.paid') {
@@ -213,7 +249,7 @@ export class PaymentService {
       const paymentId = paymentObj?.id;
 
       if (!orderId || !paymentId) {
-        logger.warn({ payload }, 'Order ID or Payment ID missing in webhook payload');
+        logger.warn(withErrorCategory('payment', { payload }), 'Order ID or Payment ID missing in webhook payload');
         return;
       }
 
@@ -245,10 +281,17 @@ export class PaymentService {
           paymentId,
         });
 
+        audit({
+          action: 'payment.webhook_enrollment_queued',
+          targetId: orderId,
+          outcome: 'success',
+          paymentId,
+          eventName: event,
+        });
         logger.info({ orderId, paymentId }, 'Webhook: Pushed enrollment job to queue');
       } finally {
         if (lock) {
-          await lock.release().catch((e: any) => logger.error({ err: e.message }, 'Failed to release lock'));
+          await lock.release().catch((e: any) => logger.error(withErrorCategory('payment', { error: e }), 'Failed to release lock'));
         }
       }
     }
