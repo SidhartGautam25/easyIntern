@@ -4,7 +4,7 @@ import { PaymentRepository } from '../repositories/PaymentRepository.js';
 import { CollegeRepository } from '../repositories/CollegeRepository.js';
 import { StudentRepository } from '../repositories/StudentRepository.js';
 import { createOrderSchema, verifyPaymentSchema } from '../utils/validation.js';
-import { logger } from '../utils/logger.js';
+import { logger, withErrorCategory } from '../utils/logger.js';
 
 export class PaymentController {
   private paymentService: PaymentService;
@@ -77,7 +77,7 @@ export class PaymentController {
       ctx.status = 200;
       ctx.body = { success: true, message: 'Webhook processed' };
     } catch (err: any) {
-      logger.error({ err: err.message }, 'Razorpay Webhook execution failed');
+      logger.error(withErrorCategory('payment', { error: err }), 'Razorpay Webhook execution failed');
       ctx.status = 400;
       ctx.body = { success: false, message: err.message || 'Webhook verification failed' };
     }
