@@ -19,7 +19,7 @@ import { captureReferralFromUrl, peekStoredReferralCode, resolveValidReferralCod
 import { formatRupees, isLnmuStudent } from "@/lib/feeRules";
 import { resolveStudentFeeBreakdown } from "@/lib/collegeFees";
 import { runRegistrationRazorpayCheckout } from "@/lib/registrationPayment";
-import { usePayment } from "@/hooks/useBackend";
+import { usePayment, useAdmin } from "@/hooks/useBackend";
 import { loadRazorpayCheckout } from "@/lib/razorpayCheckout";
 import { baSubjects, bcomSubjects, bscSubjects } from "@/lib/subjectOptions";
 import { displayCollegeName } from "@/lib/collegeDisplay";
@@ -115,6 +115,7 @@ export const RegistrationForm = ({
 }) => {
   const navigate = useNavigate();
   const { pollOrderStatus } = usePayment();
+  const { registerStudent } = useAdmin();
   const isAdminVariant = variant === "admin";
   const isCyberCafeVariant = variant === "cybercafe";
   const [step, setStep] = useState<Step>(1);
@@ -591,156 +592,34 @@ export const RegistrationForm = ({
       const selectedCollege = colleges.find((c) => c.id === collegeId);
       const selectedUni = unis.find((u) => u.id === universityId);
 
-      const ephemeral = createEphemeralSupabaseAuthClient();
-      const { data: authData, error: authError } = await ephemeral.auth.signUp({
-        email: normalizedEmail,
-        password,
-        options: { data: { full_name: fullName } },
-      });
-
-      if (authError) {
-        const low = authError.message.toLowerCase();
-        if (
-          low.includes("already registered") ||
-          low.includes("already exists") ||
-          authError.code === "user_already_exists"
-        ) {
-          throw new Error(
-            "This email is already registered. Use a different email or find the student in the directory to edit their profile."
-          );
-        }
-        throw authError;
-      }
-
-      const userId = authData.user?.id;
-      if (!userId) {
-        throw new Error(
-          "Signup did not return a user id. In Supabase Auth, turn off email confirmation for signups or confirm the account, then retry."
-        );
-      }
-
-      const { data: latestStudents } = await supabase
-        .from("students")
-        .select("registration_id")
-        .not("registration_id", "is", null)
-        .order("created_at", { ascending: false })
-        .limit(10);
-
-      let nextSeq = 10001;
-      if (latestStudents && latestStudents.length > 0) {
-        const seqs = latestStudents
-          .map((s) => {
-            const parts = s.registration_id.split("/");
-            return parts.length === 4 ? parseInt(parts[3], 10) : 0;
-          })
-          .filter((n) => !isNaN(n));
-        if (seqs.length > 0) nextSeq = Math.max(...seqs) + 1;
-      }
-      const currentYear = new Date().getFullYear();
-      let regId = `EZY/${currentYear}/INT/${nextSeq}`;
-
-      const cyberData = JSON.parse(sessionStorage.getItem("cybercafe_profile") || "{}");
-
-      const basePayload = {
-        id: userId,
-        email: normalizedEmail,
-        full_name: fullName,
-        gender,
-        parent_name: parentName,
-        contact_number: contact,
-        university_name: selectedUni?.name || "",
-        college_name: displayCollegeName(selectedCollege?.name) || "",
-        course,
-        internship_domain: course,
-        degree,
-        department: departmentName,
-        class_semester: classSem,
-        academic_session: session,
-        roll_number: rollNo,
-        emergency_name: emName,
-        emergency_contact: emPhone,
-        emergency_relation: emRel,
-        status: "Active" as const,
-        cybercafe_shop_name: cyberData.shop_name || null,
-        cybercafe_email: cyberData.email || null,
-        metadata: {
-          source: "admin_manual_registration",
-          subject,
-          fullName: fullName,
-          parentName: parentName,
+      const payload = {
+        admin_id: sessionWrap.session.user.id,
+        student_data: {
+          email: normalizedEmail,
+          full_name: fullName,
           gender,
-          contact,
-          university: selectedUni?.name || "",
-          college: selectedCollege?.name || "",
+          parent_name: parentName,
+          contact_number: contact,
+          university_name: selectedUni?.name || "",
+          college_name: displayCollegeName(selectedCollege?.name) || "",
+          course,
+          internship_domain: course,
           degree,
           department: departmentName,
-          session,
-          semester: classSem,
-          rollNo,
-          course,
-          internship_mode: internshipMode,
+          class_semester: classSem,
+          academic_session: session,
+          roll_number: rollNo,
+          emergency_name: emName,
+          emergency_contact: emPhone,
+          emergency_relation: emRel,
+          password,
+          subject,
         },
+        payment_amount: 0,
+        transaction_id: `pay_admin_${Date.now()}`
       };
 
-      const studentDataPayload = withStoredDirectoryPassword(basePayload, password);
-
-      let retryCount = 0;
-      while (retryCount < 10) {
-        studentDataPayload.registration_id = regId;
-        const { error } = await supabase.from("students").upsert(studentDataPayload);
-        if (error) {
-          if (error.code === "23505" && (error.message.includes("registration_id") || error.detail?.includes("registration_id"))) {
-            nextSeq++;
-            regId = `EZY/${currentYear}/INT/${nextSeq}`;
-            retryCount++;
-            continue;
-          }
-          throw error;
-        }
-        break;
-      }
-
-      await adminUpsertStudentProfile(supabase, {
-        id: userId,
-        full_name: fullName,
-        email: normalizedEmail,
-        contact_number: contact,
-        gender,
-        parent_name: parentName,
-      });
-
-      await supabase.from("user_roles").upsert({ user_id: userId, role: "student" }, { onConflict: "user_id,role" });
-
-      await supabase.from("payment_success").insert({
-        user_id: userId,
-        payment_id: `pay_admin_${Date.now()}`,
-        amount_paise: 0,
-        email: normalizedEmail,
-        full_name: fullName,
-        college_name: displayCollegeName(selectedCollege?.name) || "",
-        status: "success",
-      });
-
-      try {
-        const mailRes = await fetch(getSendMailApiUrl(), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            to: normalizedEmail,
-            email: normalizedEmail,
-            action: "registration_success",
-            data: {
-              fullName,
-              regId,
-              password,
-              loginLink: buildStudentCredentialLoginLink(window.location.origin),
-            },
-          }),
-        });
-        await assertSendMailOk(mailRes);
-      } catch {
-        /* optional welcome mail */
-      }
+      await registerStudent(payload);
 
       toast.success("Student added successfully.");
       onAdminComplete?.({ email: normalizedEmail, full_name: fullName });
