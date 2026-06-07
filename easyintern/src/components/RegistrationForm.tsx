@@ -18,8 +18,7 @@ import { buildStudentCredentialLoginLink } from "@/lib/authRoutes";
 import { captureReferralFromUrl, peekStoredReferralCode, resolveValidReferralCode, logReferralClickFromUrl } from "@/lib/referral";
 import { formatRupees, isLnmuStudent } from "@/lib/feeRules";
 import { resolveStudentFeeBreakdown } from "@/lib/collegeFees";
-import { runRegistrationRazorpayCheckout } from "@/lib/registrationPayment";
-import { usePayment } from "@/hooks/useBackend";
+import { runClientRazorpayCheckout } from "@/lib/clientRazorpayPayment";
 import { loadRazorpayCheckout } from "@/lib/razorpayCheckout";
 import { baSubjects, bcomSubjects, bscSubjects } from "@/lib/subjectOptions";
 import { displayCollegeName } from "@/lib/collegeDisplay";
@@ -114,7 +113,6 @@ export const RegistrationForm = ({
   onAdminComplete?: (info: { email: string; full_name: string }) => void;
 }) => {
   const navigate = useNavigate();
-  const { pollOrderStatus } = usePayment();
   const isAdminVariant = variant === "admin";
   const isCyberCafeVariant = variant === "cybercafe";
   const [step, setStep] = useState<Step>(1);
@@ -487,66 +485,25 @@ export const RegistrationForm = ({
     );
     const finalAmount = breakdown.totalPaise;
 
-    const selectedUniName = selectedUni?.name || "";
-    const meta: Record<string, unknown> = { subject, internship_mode: internshipMode };
-    if (isLnmuStudent(selectedUniName) && consentFormUrlRef.current) {
-      meta.consent_form_url = consentFormUrlRef.current;
-    }
+    const payResult = await runClientRazorpayCheckout({
+      paymentSettings,
+      amountPaise: finalAmount,
+      prefill: { name: fullName, email: email.trim(), contact },
+    });
 
-    const cyberData = JSON.parse(sessionStorage.getItem('cybercafe_profile') || '{}');
-
-    const studentData = {
-      fullName: fullName.trim(),
-      gender: gender as any,
-      parentName: parentName.trim(),
-      contact: contact.trim(),
-      email: email.trim().toLowerCase(),
-      universityId,
-      collegeId,
-      degree,
-      departmentName: departmentName.trim() || undefined,
-      classSem,
-      session,
-      subject: subject.trim() || undefined,
-      rollNo,
-      course,
-      internshipMode: internshipMode as any,
-      emName: emName.trim() || undefined,
-      emPhone: emPhone.trim() || undefined,
-      emRel: emRel.trim() || undefined,
-      password,
-      consentFormUrl: consentFormUrlRef.current || undefined,
-      referralCode: peekStoredReferralCode() || undefined,
-      metadata: meta,
-    };
-
-    try {
-      const payResult = await runRegistrationRazorpayCheckout({
-        paymentSettings,
-        amountPaise: finalAmount,
-        prefill: { name: fullName, email: email.trim(), contact },
-        studentData,
-      });
-
-      if (!payResult.success) {
-        if (!payResult.cancelled) {
-          toast.error("Payment failed. Please try again.");
-        }
-        return { success: false };
+    if (!payResult.success) {
+      if (!payResult.cancelled) {
+        toast.error("Payment failed. Please try again.");
       }
-
-      return {
-        success: true,
-        payment_id: payResult.payment_id,
-        amount: payResult.amount,
-        mode: payResult.mode,
-        orderId: payResult.orderId || "",
-        userId: payResult.userId,
-      };
-    } catch (err: any) {
-      toast.error(err.message || "Payment process encountered an error.");
       return { success: false };
     }
+
+    return {
+      success: true,
+      payment_id: payResult.payment_id,
+      amount: payResult.amount,
+      mode: "legacy" as const,
+    };
   };
 
   const submit = async () => {
@@ -773,22 +730,25 @@ export const RegistrationForm = ({
 
       const isLegacyPaidFlow = paymentSettings?.is_active && result?.mode === "legacy";
       if (paymentSettings?.is_active && !isLegacyPaidFlow) {
-        toast.info("Payment verified. Setting up your account, please wait...");
-        const pollRes = await pollOrderStatus(result.orderId);
-        regId = pollRes.registrationId || "";
-
-        // Retrieve the created student ID (userId) from Supabase
-        const { data: studentRecord } = await supabase
-          .from("students")
-          .select("id")
-          .eq("email", normalizedEmail)
-          .maybeSingle();
-        userId = studentRecord?.id;
-
-        if (!userId) {
-          throw new Error("Enrollment finished but account details could not be loaded. Please sign in.");
+        // Server verify inserts student row — slight replication lag can yield empty reads.
+        let enrolled: { id: string; registration_id: string | null } | null = null;
+        for (let attempt = 0; attempt < 12; attempt++) {
+          const { data } = await supabase
+            .from("students")
+            .select("id, registration_id")
+            .eq("email", normalizedEmail)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (data?.id) {
+            enrolled = data;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 450));
         }
-
+        userId = enrolled?.id;
+        regId = enrolled?.registration_id || "";
+        if (!userId) throw new Error("Payment captured but enrollment not completed. Please contact support.");
         if (validReferral && userId) {
           const { error: refErr } = await supabase
             .from("students")

@@ -1,7 +1,7 @@
 import { IStudentRepository } from '../repositories/interfaces/IStudentRepository.js';
 import { mailService } from './MailService.js';
 import { supabase } from '../lib/supabase.js';
-import { audit, logger, withErrorCategory } from '../utils/logger.js';
+import { logger } from '../utils/logger.js';
 
 export class AuthService {
   private studentRepo: IStudentRepository;
@@ -27,7 +27,7 @@ export class AuthService {
     });
 
     if (insertError) {
-      logger.error(withErrorCategory('database', { error: insertError, email: normalizedEmail }), 'Failed to insert password reset OTP');
+      logger.error({ insertError, email: normalizedEmail }, 'Failed to insert password reset OTP');
       throw new Error(`Failed to generate OTP: ${insertError.message}`);
     }
 
@@ -39,12 +39,6 @@ export class AuthService {
       html,
     });
 
-    audit({
-      action: 'auth.password_reset_otp_requested',
-      actorEmail: normalizedEmail,
-      targetId: profile.id,
-      outcome: 'success',
-    });
     logger.info({ email: normalizedEmail }, 'Password reset OTP requested and sent successfully');
   }
 
@@ -71,7 +65,7 @@ export class AuthService {
     });
 
     if (userIdError || !userId) {
-      logger.error(withErrorCategory('database', { error: userIdError, email: normalizedEmail }), 'Failed to resolve user ID by email during password reset');
+      logger.error({ userIdError, email: normalizedEmail }, 'Failed to resolve user ID by email during password reset');
       throw new Error('User account not found for this email address.');
     }
 
@@ -80,19 +74,12 @@ export class AuthService {
     });
 
     if (updateError) {
-      logger.error(withErrorCategory('auth', { error: updateError, userId }), 'Failed to update user password in Auth admin');
+      logger.error({ updateError, userId }, 'Failed to update user password in Auth admin');
       throw new Error(`Failed to update password: ${updateError.message}`);
     }
 
     // Clean up reset OTPs
     await supabase.from('password_resets').delete().eq('email', normalizedEmail);
-    audit({
-      action: 'auth.password_reset_completed',
-      actorId: userId,
-      actorEmail: normalizedEmail,
-      targetId: userId,
-      outcome: 'success',
-    });
     logger.info({ email: normalizedEmail, userId }, 'Password reset completed successfully');
   }
 }

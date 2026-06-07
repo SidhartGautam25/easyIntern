@@ -1,13 +1,17 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { toast } from "sonner";
 import {
+  runClientRazorpayCheckout,
   type PublicPaymentSettings,
+  prepareDomForRazorpayCheckout,
+  razorpayCheckoutImageUrl,
+  openRazorpayModal,
 } from "@/lib/clientRazorpayPayment";
 import { getRazorpayConstructor, loadRazorpayCheckout } from "@/lib/razorpayCheckout";
 import { paymentCreateOrder, paymentVerify } from "@/lib/paymentApi";
 
 export type RegistrationPaymentResult =
-  | { success: true; mode: "verified"; payment_id: string; amount: number; userId?: string; orderId?: string }
+  | { success: true; mode: "verified"; payment_id: string; amount: number; userId?: string }
   | { success: true; mode: "legacy"; payment_id: string; amount: number }
   | { success: false; cancelled?: boolean };
 
@@ -107,11 +111,13 @@ function openRazorpayCheckout(
   onModalOpen?: () => void
 ): Promise<RegistrationPaymentResult> {
   return new Promise((resolve) => {
+    const cleanupDom = prepareDomForRazorpayCheckout();
     let settled = false;
 
     function finish(val: RegistrationPaymentResult) {
       if (settled) return;
       settled = true;
+      cleanupDom();
       resolve(val);
     }
 
@@ -145,27 +151,37 @@ function openRazorpayCheckout(
 
     rzp.on("payment.failed", () => finish({ success: false }));
 
-    if (onModalOpen) {
-      onModalOpen();
-    }
-    rzp.open();
+    openRazorpayModal(rzp, {
+      onModalOpen,
+      onModalMissing: () => {
+        toast.error(
+          "Payment window did not open. Allow scripts from checkout.razorpay.com, disable ad blockers, and try again."
+        );
+        finish({ success: false });
+      },
+    });
   });
 }
 
-const ORDER_API_ENABLED = true;
+const ORDER_API_ENABLED = import.meta.env.VITE_REGISTRATION_USE_ORDER_API === "true";
 
-async function tryCreateOrder(
-  body: { studentData: Record<string, unknown>; amount: number }
+async function tryCreateOrderWithTimeout(
+  body: { studentData: Record<string, unknown>; amount: number },
+  timeoutMs: number
 ): Promise<{ ok: boolean; status: number; data: Record<string, unknown> } | null> {
   try {
-    return await paymentCreateOrder(body);
+    return await Promise.race([
+      paymentCreateOrder(body),
+      new Promise<null>((resolve) => window.setTimeout(() => resolve(null), timeoutMs)),
+    ]);
   } catch {
     return null;
   }
 }
 
 /**
- * Opens Razorpay for registration. Force secure server-side order checkout.
+ * Opens Razorpay for registration. Default: legacy checkout (instant modal, no API wait).
+ * Set VITE_REGISTRATION_USE_ORDER_API=true to try server order first (2.5s cap, then legacy).
  */
 export async function runRegistrationRazorpayCheckout(opts: {
   paymentSettings: PublicPaymentSettings;
@@ -187,69 +203,89 @@ export async function runRegistrationRazorpayCheckout(opts: {
 
   const scriptReady = loadRazorpayCheckout();
 
-  if (opts.studentData) {
+  if (ORDER_API_ENABLED && opts.studentData) {
     const [orderRes] = await Promise.all([
-      tryCreateOrder({ studentData: opts.studentData, amount: amountPaise }),
+      tryCreateOrderWithTimeout({ studentData: opts.studentData, amount: amountPaise }, 1500),
       scriptReady,
     ]);
 
-    if (!orderRes || !orderRes.ok || orderRes.data.success !== true) {
-      const errorMsg = orderRes?.data?.message || "Failed to create secure payment order on server.";
-      throw new Error(String(errorMsg));
-    }
+    if (orderRes?.ok && orderRes.data.success === true) {
+      const orderId = String(orderRes.data.orderId || "");
+      const orderKey = String(orderRes.data.key || key);
+      const orderAmount = Number(orderRes.data.amount) || amountPaise;
+      const currency = String(orderRes.data.currency || settings?.currency || "INR");
 
-    const orderId = String(orderRes.data.orderId || "");
-    const orderKey = String(orderRes.data.key || key);
-    const orderAmount = Number(orderRes.data.amount) || amountPaise;
-    const currency = String(orderRes.data.currency || settings?.currency || "INR");
+      if (orderId) {
+    const checkoutImage = razorpayCheckoutImageUrl();
+    const checkoutResult = await openRazorpayCheckout(
+      {
+        key: orderKey,
+        order_id: orderId,
+        amount: orderAmount,
+        currency,
+        name: "EzyIntern",
+        description: "Internship Registration Fee",
+        ...(checkoutImage ? { image: checkoutImage } : {}),
+        prefill: opts.prefill,
+      },
+          async (response) => {
+            const paymentId = response?.razorpay_payment_id;
+            const orderIdFromRzp = response?.razorpay_order_id;
+            const signature = response?.razorpay_signature;
+            if (!paymentId || !orderIdFromRzp || !signature) {
+              return { success: false as const };
+            }
 
-    if (orderId) {
-      const checkoutImage = "/logo.png";
-      const checkoutResult = await openRazorpayCheckout(
-        {
-          key: orderKey,
-          order_id: orderId,
-          amount: orderAmount,
-          currency,
-          name: "EzyIntern",
-          description: "Internship Registration Fee",
-          image: checkoutImage,
-          prefill: opts.prefill,
-        },
-        async (response) => {
-          const paymentId = response?.razorpay_payment_id;
-          const orderIdFromRzp = response?.razorpay_order_id;
-          const signature = response?.razorpay_signature;
-          if (!paymentId || !orderIdFromRzp || !signature) {
-            return { success: false as const };
-          }
+            const verifyRes = await paymentVerify({
+              razorpay_payment_id: paymentId,
+              razorpay_order_id: orderIdFromRzp,
+              razorpay_signature: signature,
+            });
 
-          const verifyRes = await paymentVerify({
-            razorpay_payment_id: paymentId,
-            razorpay_order_id: orderIdFromRzp,
-            razorpay_signature: signature,
-          });
+            if (!verifyRes.ok || !verifyRes.data.success) {
+              const status = verifyRes.status;
+              const raw = String(verifyRes.data?.message || "Payment verification failed");
+              // Payment signature was valid but server enrollment failed — complete on the client.
+              if (paymentId && status !== 400) {
+                console.warn("[payment] verify API enrollment failed; using client completion:", raw);
+                return {
+                  success: true as const,
+                  mode: "legacy" as const,
+                  payment_id: paymentId,
+                  amount: orderAmount,
+                };
+              }
+              throw new Error(raw);
+            }
 
-          if (!verifyRes.ok || !verifyRes.data.success) {
-            const raw = String(verifyRes.data?.message || "Payment verification failed");
-            throw new Error(raw);
-          }
+            return {
+              success: true as const,
+              mode: "verified" as const,
+              payment_id: paymentId,
+              amount: orderAmount,
+              userId: typeof verifyRes.data.userId === "string" ? verifyRes.data.userId : undefined,
+            };
+          },
+          opts.onModalOpen
+        );
 
-          return {
-            success: true as const,
-            mode: "verified" as const,
-            payment_id: paymentId,
-            amount: orderAmount,
-            userId: typeof verifyRes.data.userId === "string" ? verifyRes.data.userId : undefined,
-            orderId,
-          };
-        },
-        opts.onModalOpen
-      );
-
-      return checkoutResult;
+        if (checkoutResult.success) return checkoutResult;
+      }
     }
   }
 
-  throw new Error("Registration student data is required to process secure payment.");
+  if (!getRazorpayConstructor()) {
+    await scriptReady;
+  }
+
+  const legacy = await runClientRazorpayCheckout({
+    paymentSettings: settings || opts.paymentSettings,
+    amountPaise,
+    prefill: opts.prefill,
+    description: "Internship Registration Fee",
+    onModalOpen: opts.onModalOpen,
+  });
+
+  if (!legacy.success) return legacy;
+  return { ...legacy, mode: "legacy" };
 }
