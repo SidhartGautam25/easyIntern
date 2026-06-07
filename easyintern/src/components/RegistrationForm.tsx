@@ -530,7 +530,8 @@ export const RegistrationForm = ({
       });
 
       if (!payResult.success) {
-        if (!payResult.cancelled) {
+        const isCancelled = (payResult as { success: false; cancelled?: boolean }).cancelled;
+        if (!isCancelled) {
           toast.error("Payment failed. Please try again.");
         }
         return { success: false };
@@ -541,8 +542,8 @@ export const RegistrationForm = ({
         payment_id: payResult.payment_id,
         amount: payResult.amount,
         mode: payResult.mode,
-        orderId: payResult.orderId || "",
-        userId: payResult.userId,
+        orderId: (payResult.mode === "verified" ? payResult.orderId : undefined) || "",
+        userId: payResult.mode === "verified" ? payResult.userId : undefined,
       };
     } catch (err: any) {
       toast.error(err.message || "Payment process encountered an error.");
@@ -893,7 +894,7 @@ export const RegistrationForm = ({
       {step === 1 && (
         <div className="space-y-4 animate-fade-in">
           <div className="grid sm:grid-cols-2 gap-4">
-            <div className="space-y-1.5"><Label className="text-xs">Full Name *</Label><Input value={fullName} onChange={(e) => setFullName(e.target.value)} bsSize="sm" /></div>
+            <div className="space-y-1.5"><Label className="text-xs">Full Name *</Label><Input value={fullName} onChange={(e) => setFullName(e.target.value)} /></div>
             <div className="space-y-1.5">
               <Label className="text-xs">Gender *</Label>
               <RadioGroup value={gender} onValueChange={setGender} className="flex gap-4 pt-1">
