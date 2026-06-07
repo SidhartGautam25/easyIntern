@@ -169,7 +169,7 @@ export function useAuthBackend() {
     setLoading(true);
     setError(null);
     try {
-      const res = await apiClient.post('/auth/request-otp', { email });
+      const res = await apiClient.post('/auth/forgot-password', { email });
       toast.success('OTP sent to email address.');
       return res as any;
     } catch (err: any) {
@@ -181,12 +181,12 @@ export function useAuthBackend() {
     }
   }, []);
 
-  const resetPassword = useCallback(async (email: string, otp: string) => {
+  const resetPassword = useCallback(async (email: string, otp: string, newPassword: string) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await apiClient.post('/auth/reset-password', { email, otp });
-      toast.success('Password reset initiated. Check your inbox.');
+      const res = await apiClient.post('/auth/reset-password', { email, otp, newPassword });
+      toast.success('Password updated successfully.');
       return res as any;
     } catch (err: any) {
       setError(err);

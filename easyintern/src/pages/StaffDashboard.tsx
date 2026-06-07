@@ -68,9 +68,11 @@ import { EDIT_GENDER_SENTINEL } from "@/lib/studentCredentials";
 import { adminUpsertStudentProfile } from "@/lib/adminProfileUpsert";
 import { StudentEditFormFields } from "@/components/StudentEditFormFields";
 import { RegistrationForm } from "@/components/RegistrationForm";
+import { useAdmin } from "@/hooks/useBackend";
 
 const StaffDashboard = () => {
   const navigate = useNavigate();
+  const { registerStudent } = useAdmin();
   const [loading, setLoading] = useState(true);
   const [processing, setProcessing] = useState(false);
   const [staffName, setStaffName] = useState("");
@@ -433,153 +435,40 @@ const StaffDashboard = () => {
     const metadata = lead.metadata || {};
     setProcessing(true);
     try {
-      // 1. Create a secondary client to sign up the student without logging out the staff
-      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-      const supabaseAnonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
-      const transferClient = createClient(supabaseUrl, supabaseAnonKey, {
-        auth: {
-          persistSession: false,
-          autoRefreshToken: false,
-          detectSessionInUrl: false,
-          storage: {
-            getItem: () => null,
-            setItem: () => {},
-            removeItem: () => {},
-          }
-        }
-      });
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) throw new Error("Session expired. Please login again.");
 
-      // 2. Sign up the user
-      let userId: string | undefined;
-      const { data: authData, error: authError } = await transferClient.auth.signUp({
-        email: leadEmail,
-        password: password,
-        options: {
-          data: { full_name: leadName }
-        }
-      });
+      const rawAmount = lead.amount_paise || lead.amount || 9900;
+      const amountRupees = rawAmount > 50000 ? rawAmount / 100 : rawAmount; // convert if in paise
 
-      if (authError) {
-        // Check if user already exists
-        if (authError.message.toLowerCase().includes("already registered") || authError.message.toLowerCase().includes("already exists")) {
-          const { data: existingProfile } = await supabase
-            .from("profiles")
-            .select("id")
-            .eq("email", leadEmail)
-            .maybeSingle();
-          
-          if (existingProfile) {
-            userId = existingProfile.id;
-          } else {
-            throw new Error("User is registered in Auth but has no profile record.");
-          }
-        } else {
-          throw authError;
-        }
-      } else {
-        userId = authData.user?.id;
-      }
-
-      if (!userId) throw new Error("Failed to create or find auth user");
-
-      // 3. Determine next Registration ID
-      const { data: latestStudents } = await supabase
-        .from("students")
-        .select("registration_id")
-        .not("registration_id", "is", null)
-        .order("created_at", { ascending: false })
-        .limit(10); // Check last 10 to find the true numeric max
-
-      let nextSeq = 10001;
-      if (latestStudents && latestStudents.length > 0) {
-        const seqs = latestStudents.map(s => {
-          const parts = s.registration_id.split('/');
-          // Expected: EZY/YEAR/INT/SEQ
-          return parts.length === 4 ? parseInt(parts[3], 10) : 0;
-        }).filter(n => !isNaN(n));
-        if (seqs.length > 0) {
-          nextSeq = Math.max(...seqs) + 1;
-        }
-      }
-
-      const currentYear = new Date().getFullYear();
-      let regId = `EZY/${currentYear}/INT/${nextSeq}`;
-
-      // 4. Create Student Record with Collision Protection Loop
-      let studentError = null;
-      let retryCount = 0;
-      
-      const enrichedMeta = { ...(typeof metadata === "object" && metadata !== null ? metadata : {}), password };
-
-      const studentDataPayload: any = {
-        id: userId,
-        email: leadEmail,
-        full_name: leadName,
-        gender: metadata.gender,
-        parent_name: metadata.parentName,
-        contact_number: lead.user_phone || lead.contact_number || metadata.contact,
-        university_name: lead.university_name || metadata.university,
-        college_name: lead.college_name || metadata.college,
-        course: metadata.course,
-        internship_domain: metadata.course,
-        degree: metadata.degree,
-        department: metadata.department,
-        class_semester: metadata.semester,
-        academic_session: metadata.session,
-        roll_number: metadata.rollNo,
-        emergency_name: metadata.emName,
-        emergency_contact: metadata.emPhone,
-        emergency_relation: metadata.emRel,
-        status: 'Active',
-        cybercafe_shop_name: lead.cybercafe_shop_name,
-        cybercafe_email: lead.cybercafe_email,
-        password,
-        metadata: enrichedMeta,
+      const payload = {
+        admin_id: session.user.id,
+        student_data: {
+          email: String(leadEmail).trim().toLowerCase(),
+          full_name: leadName,
+          gender: metadata.gender,
+          parent_name: metadata.parentName,
+          contact_number: lead.user_phone || lead.contact_number || metadata.contact || "",
+          university_name: lead.university_name || metadata.university || "",
+          college_name: lead.college_name || metadata.college || "",
+          course: metadata.course,
+          internship_domain: metadata.course,
+          degree: metadata.degree,
+          department: metadata.department,
+          class_semester: metadata.semester,
+          academic_session: metadata.session,
+          roll_number: metadata.rollNo,
+          emergency_name: metadata.emName,
+          emergency_contact: metadata.emPhone,
+          emergency_relation: metadata.emRel,
+          password,
+        },
+        payment_amount: amountRupees,
+        transaction_id: `STAFF_TRANS_${Math.random().toString(36).substring(2, 10).toUpperCase()}`
       };
 
-      while (retryCount < 10) {
-        studentDataPayload.registration_id = regId;
-        const { error } = await supabase.from("students").upsert(studentDataPayload);
-        
-        if (error) {
-          // Check for unique constraint violation on registration_id
-          if (error.code === '23505' && (error.message.includes('registration_id') || error.detail?.includes('registration_id'))) {
-            nextSeq++;
-            regId = `EZY/${currentYear}/INT/${nextSeq}`;
-            retryCount++;
-            continue;
-          }
-          studentError = error;
-        } else {
-          studentError = null;
-        }
-        break;
-      }
-
-      if (studentError) throw studentError;
-
-      // 5. Update Profile & Role
-      await adminUpsertStudentProfile(supabase, {
-        id: userId,
-        full_name: leadName,
-        email: String(leadEmail).trim().toLowerCase(),
-        contact_number: lead.user_phone || lead.contact_number || metadata.contact,
-        gender: metadata.gender,
-        parent_name: metadata.parentName,
-      });
-      
-      await supabase.from("user_roles").upsert({ user_id: userId, role: "student" }, { onConflict: 'user_id,role' });
-      
-      // Create Payment Entry
-      await supabase.from("payment_success").insert({
-        user_id: userId,
-        payment_id: `STAFF_TRANS_${Math.random().toString(36).substring(2, 10).toUpperCase()}`,
-        amount_paise: lead.amount_paise || lead.amount || 9900,
-        email: leadEmail,
-        full_name: leadName,
-        college_name: lead.college_name || metadata.college,
-        status: 'success'
-      });
+      const result = await registerStudent(payload);
+      const userId = result?.data?.userId;
 
       // 6. Delete Lead / draft
       if (lead.registration_draft && lead.draft_id) {
@@ -591,7 +480,7 @@ const StaffDashboard = () => {
         await supabase.from("payment_success").delete().eq("id", lead.id);
       }
 
-      toast.success(`Lead successfully transferred! (ID: ${regId})`);
+      toast.success("Lead successfully transferred!");
       
       await logAdminAction(
         'TRANSFER', 
