@@ -28,16 +28,5 @@ export const config = {
 
 // Simple sanity check
 if (!config.supabaseServiceRoleKey || config.supabaseServiceRoleKey === 'placeholder_please_replace_with_actual_service_role_key') {
-  process.stderr.write(`${JSON.stringify({
-    level: 'warn',
-    service: process.env.SERVICE_NAME || 'ezyintern-server',
-    environment: config.nodeEnv,
-    message: 'SUPABASE_SERVICE_ROLE_KEY is not configured or is a placeholder. Write operations to database tables requiring permissions will fail.',
-    event: {
-      category: 'configuration',
-      action: 'config.supabase_service_role_key_missing',
-      outcome: 'failure',
-    },
-    time: new Date().toISOString(),
-  })}\n`);
+  console.warn('⚠️ WARNING: SUPABASE_SERVICE_ROLE_KEY is not configured or is a placeholder. Write operations to database tables requiring permissions will fail.');
 }

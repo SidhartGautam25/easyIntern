@@ -1,6 +1,6 @@
 import { Middleware } from 'koa';
 import { supabase } from '../lib/supabase.js';
-import { audit, logger, withErrorCategory } from '../utils/logger.js';
+import { logger } from '../utils/logger.js';
 
 export const authMiddleware: Middleware = async (ctx, next) => {
   const authHeader = ctx.headers.authorization;
@@ -24,12 +24,7 @@ export const authMiddleware: Middleware = async (ctx, next) => {
     ctx.state.user = user;
     await next();
   } catch (err: any) {
-    logger.warn(withErrorCategory('auth', { error: err, path: ctx.path }), 'Auth middleware verification failure');
-    audit({
-      action: 'auth.token_verified',
-      outcome: 'failure',
-      targetId: ctx.path,
-    });
+    logger.warn({ err: err.message, url: ctx.url }, 'Auth middleware verification failure');
     ctx.throw(err.status || 401, err.message || 'Unauthorized');
   }
 };
@@ -47,18 +42,12 @@ export const requireRoles = (roles: string[]): Middleware => {
       .eq('user_id', userId);
 
     if (error) {
-      logger.error(withErrorCategory('database', { error, userId }), 'Role authorization check database error');
+      logger.error({ error, userId }, 'Role authorization check database error');
       ctx.throw(500, 'Database error during authorization check');
     }
 
     const hasRole = (userRoles || []).some((r: any) => roles.includes(r.role));
     if (!hasRole) {
-      audit({
-        action: 'auth.role_authorized',
-        actorId: userId,
-        outcome: 'denied',
-        requiredRoles: roles,
-      });
       ctx.throw(403, 'Access denied. Required privileges are missing.');
     }
 

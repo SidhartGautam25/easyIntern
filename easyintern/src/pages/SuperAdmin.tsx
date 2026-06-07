@@ -42,11 +42,9 @@ import { adminUpsertStudentProfile } from "@/lib/adminProfileUpsert";
 import { assertSendMailOk, getSendMailApiUrl } from "@/lib/sendMailApi";
 import { FeesManagementPanel } from "@/components/admin/FeesManagementPanel";
 import { fetchAllSupabaseRows } from "@/lib/fetchAllSupabaseRows";
-import { useAdmin } from "@/hooks/useBackend";
 
 const SuperAdmin = () => {
   const navigate = useNavigate();
-  const { registerStudent, executeTask } = useAdmin();
   const [loading, setLoading] = useState(true);
   const [allowed, setAllowed] = useState(false);
 
@@ -1347,40 +1345,159 @@ const SuperAdmin = () => {
     const metadata = lead.metadata || {};
     setProcessing(true);
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session?.access_token) throw new Error("Session expired. Please login again.");
+      // 1. Create a secondary client to sign up the student without logging out the admin
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const supabaseAnonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+      const transferClient = createClient(supabaseUrl, supabaseAnonKey, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+          storage: {
+            getItem: () => null,
+            setItem: () => {},
+            removeItem: () => {},
+          }
+        }
+      });
 
-      const rawAmount = lead.amount_paise || lead.amount || 9900;
-      const amountRupees = rawAmount > 50000 ? rawAmount / 100 : rawAmount; // convert if in paise
+      // 2. Sign up the user
+      let userId: string | undefined;
+      const { data: authData, error: authError } = await transferClient.auth.signUp({
+        email: leadEmail,
+        password: password,
+        options: {
+          data: { full_name: leadName }
+        }
+      });
 
-      const payload = {
-        admin_id: session.user.id,
-        student_data: {
-          email: String(leadEmail).trim().toLowerCase(),
-          full_name: leadName,
-          gender: metadata.gender,
-          parent_name: metadata.parentName,
-          contact_number: lead.user_phone || metadata.contact || "",
-          university_name: lead.university_name || metadata.university || "",
-          college_name: lead.college_name || metadata.college || "",
-          course: metadata.course,
-          internship_domain: metadata.course,
-          degree: metadata.degree,
-          department: metadata.department,
-          class_semester: metadata.semester,
-          academic_session: metadata.session,
-          roll_number: metadata.rollNo,
-          emergency_name: metadata.emName,
-          emergency_contact: metadata.emPhone,
-          emergency_relation: metadata.emRel,
-          password,
-        },
-        payment_amount: amountRupees,
-        transaction_id: `ADMIN_TRANS_${Math.random().toString(36).substring(2, 10).toUpperCase()}`
+      if (authError) {
+        // Check if user already exists
+        if (authError.message.toLowerCase().includes("already registered") || authError.message.toLowerCase().includes("already exists")) {
+          const { data: existingProfile } = await supabase
+            .from("profiles")
+            .select("id")
+            .eq("email", leadEmail)
+            .maybeSingle();
+          
+          if (existingProfile) {
+            userId = existingProfile.id;
+          } else {
+            // Final fallback: Try RPC to get ID from auth.users directly
+            const { data: rpcUserId, error: rpcError } = await supabase.rpc('get_user_id_by_email', { email_text: leadEmail });
+            if (!rpcError && rpcUserId) {
+              userId = rpcUserId;
+            } else {
+              throw new Error("User is registered in Auth but has no profile and search failed. Please run the SQL fix.");
+            }
+          }
+        } else {
+          throw authError;
+        }
+      } else {
+        userId = authData.user?.id;
+      }
+
+      if (!userId) throw new Error("Failed to create or find auth user");
+
+      // 3. Determine next Registration ID
+      const { data: latestStudents } = await supabase
+        .from("students")
+        .select("registration_id")
+        .not("registration_id", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(10);
+
+      let nextSeq = 10001;
+      if (latestStudents && latestStudents.length > 0) {
+        const seqs = latestStudents.map(s => {
+          const parts = s.registration_id.split('/');
+          // Format: EZY/YEAR/INT/SEQ
+          return parts.length === 4 ? parseInt(parts[3], 10) : 0;
+        }).filter(n => !isNaN(n));
+        if (seqs.length > 0) {
+          nextSeq = Math.max(...seqs) + 1;
+        }
+      }
+      
+      const currentYear = new Date().getFullYear();
+      let regId = `EZY/${currentYear}/INT/${nextSeq}`;
+
+      // 4. Create Student Record with Collision Protection Loop
+      let studentError = null;
+      let retryCount = 0;
+
+      const enrichedMeta = { ...(typeof metadata === "object" && metadata !== null ? metadata : {}), password };
+
+      const studentDataPayload: any = {
+        id: userId,
+        email: leadEmail,
+        full_name: leadName,
+        gender: metadata.gender,
+        parent_name: metadata.parentName,
+        contact_number: lead.user_phone || metadata.contact,
+        university_name: lead.university_name || metadata.university,
+        college_name: lead.college_name || metadata.college,
+        course: metadata.course,
+        internship_domain: metadata.course,
+        degree: metadata.degree,
+        department: metadata.department,
+        class_semester: metadata.semester,
+        academic_session: metadata.session,
+        roll_number: metadata.rollNo,
+        emergency_name: metadata.emName,
+        emergency_contact: metadata.emPhone,
+        emergency_relation: metadata.emRel,
+        status: 'Active',
+        cybercafe_shop_name: lead.cybercafe_shop_name,
+        cybercafe_email: lead.cybercafe_email,
+        password,
+        metadata: enrichedMeta,
       };
 
-      const result = await registerStudent(payload);
-      const userId = result?.data?.userId;
+      while (retryCount < 10) {
+        studentDataPayload.registration_id = regId;
+        const { error } = await supabase.from("students").upsert(studentDataPayload);
+        
+        if (error) {
+          if (error.code === '23505' && (error.message.includes('registration_id') || error.detail?.includes('registration_id'))) {
+            nextSeq++;
+            regId = `EZY/${currentYear}/INT/${nextSeq}`;
+            retryCount++;
+            continue;
+          }
+          studentError = error;
+        } else {
+          studentError = null;
+        }
+        break;
+      }
+
+      if (studentError) throw studentError;
+
+      // 5. Update Profile & Role
+      await adminUpsertStudentProfile(supabase, {
+        id: userId,
+        full_name: leadName,
+        email: String(leadEmail).trim().toLowerCase(),
+        contact_number: lead.user_phone || metadata.contact,
+        gender: metadata.gender,
+        parent_name: metadata.parentName,
+      });
+      
+      await supabase.from("user_roles").upsert({ user_id: userId, role: "student" }, { onConflict: 'user_id,role' });
+      
+      // Create Payment Entry (Transaction)
+      const { error: paymentError } = await supabase.from("payment_success").insert({
+        user_id: userId,
+        payment_id: `ADMIN_TRANS_${Math.random().toString(36).substring(2, 10).toUpperCase()}`,
+        amount_paise: lead.amount_paise || lead.amount || 9900,
+        email: leadEmail,
+        full_name: leadName,
+        college_name: lead.college_name || metadata.college,
+        status: 'success'
+      });
+      if (paymentError) console.error("Payment log error:", paymentError);
 
       // 6. Delete Lead / draft
       if (lead.registration_draft && lead.draft_id) {
@@ -1416,10 +1533,24 @@ const SuperAdmin = () => {
     if (!confirm(`Force logout "${member.full_name || member.email}" from ALL devices and browsers right now?\n\nThis action is immediate and cannot be undone.`)) return;
     setProcessing(true);
     try {
-      await executeTask({
-        action: 'force_logout',
-        target_user_id: member.id
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new Error('No session');
+
+      const apiUrl = window.location.hostname === 'localhost' ? 'https://ezyintern.in/api/admin-tasks' : '/api/admin-tasks';
+      const res = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session.access_token}`
+        },
+        body: JSON.stringify({
+          action: 'force_logout',
+          target_user_id: member.id
+        })
       });
+
+      const result = await res.json();
+      if (!result.success) throw new Error(result.error || result.message || 'Failed to force logout');
 
       toast.success(`${member.full_name || member.email} has been logged out from all devices!`);
       await logAdminAction('FORCE_LOGOUT', 'admin', `Force logged out admin: ${member.email} from all devices`, { target_user_id: member.id });
