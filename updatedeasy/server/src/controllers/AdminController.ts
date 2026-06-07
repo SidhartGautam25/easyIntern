@@ -9,7 +9,7 @@ import {
   sendMailSchema,
   sendBulkMailSchema,
 } from '../utils/validation.js';
-import { logger } from '../utils/logger.js';
+import { audit, logger } from '../utils/logger.js';
 import { supabase } from '../lib/supabase.js';
 
 export class AdminController {
@@ -156,6 +156,16 @@ export class AdminController {
         registrationId,
       },
     };
+
+    audit({
+      action: 'admin.student_registered',
+      actorId: ctx.state.user?.id,
+      targetId: userId,
+      actorEmail: ctx.state.user?.email,
+      outcome: 'success',
+      registrationId,
+      paymentAmount: amount,
+    });
   };
 
   executeAdminTask = async (ctx: Context) => {
@@ -188,6 +198,13 @@ export class AdminController {
       });
 
       if (authError) {
+        audit({
+          action: 'admin.sub_user_created',
+          actorId: ctx.state.user?.id,
+          actorEmail: ctx.state.user?.email,
+          targetId: email.trim().toLowerCase(),
+          outcome: 'failure',
+        });
         ctx.status = 400;
         ctx.body = { success: false, message: authError.message };
         return;
@@ -222,6 +239,15 @@ export class AdminController {
         });
       }
 
+      audit({
+        action: 'admin.sub_user_created',
+        actorId: ctx.state.user?.id,
+        actorEmail: ctx.state.user?.email,
+        targetId: userId,
+        outcome: 'success',
+        role: finalRole,
+        roleTag,
+      });
       ctx.status = 200;
       ctx.body = { success: true, message: `Sub-user ${email} successfully created.` };
       return;
@@ -236,6 +262,13 @@ export class AdminController {
 
       await this.studentRepo.signOutUserGlobally(target_user_id);
 
+      audit({
+        action: 'admin.user_force_logout',
+        actorId: ctx.state.user?.id,
+        actorEmail: ctx.state.user?.email,
+        targetId: target_user_id,
+        outcome: 'success',
+      });
       ctx.status = 200;
       ctx.body = { success: true, message: 'User globally signed out.' };
       return;
@@ -312,6 +345,14 @@ export class AdminController {
       html: html || String((ctx.request.body as any).message || ''),
     });
 
+    audit({
+      action: 'admin.mail_sent',
+      actorId: ctx.state.user?.id,
+      actorEmail: ctx.state.user?.email,
+      targetId: recipient,
+      outcome: 'success',
+      mailAction: action,
+    });
     ctx.status = 200;
     ctx.body = { success: true, message: 'Mail sent successfully' };
   };
@@ -336,6 +377,13 @@ export class AdminController {
     const finalSubject = subject || 'Important Announcement from EzyIntern';
 
     logger.info({ count: recipientsBatch.length }, 'Starting asynchronous bulk email dispatch');
+    audit({
+      action: 'admin.bulk_mail_started',
+      actorId: ctx.state.user?.id,
+      actorEmail: ctx.state.user?.email,
+      outcome: 'started',
+      recipientCount: recipientsBatch.length,
+    });
 
     // Run asynchronously
     (async () => {

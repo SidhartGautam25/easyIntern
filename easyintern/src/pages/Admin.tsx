@@ -57,6 +57,7 @@ import { StudentEditFormFields } from "@/components/StudentEditFormFields";
 import { ReferralsPanel } from "@/components/admin/ReferralsPanel";
 import { CollegeRostersPanel } from "@/components/admin/CollegeRostersPanel";
 import { FeesManagementPanel } from "@/components/admin/FeesManagementPanel";
+import { useAdmin } from "@/hooks/useBackend";
 
 /** Cyber partner eKYC is not used for admin decisions — never show “KYC” in admin labels. */
 function formatCyberCafeStatusLabel(status: string | undefined | null): string {
@@ -74,6 +75,7 @@ function cyberCafeRowForEdit(cafe: any) {
 
 const Admin = () => {
   const navigate = useNavigate();
+  const { registerStudent, executeTask } = useAdmin();
   const location = useLocation();
   const queryParams = new URLSearchParams(location.search);
   const [activeTab, setActiveTab] = useState(queryParams.get("tab") || "dashboard");
@@ -1570,15 +1572,13 @@ const Admin = () => {
     setProcessing(true);
     
     try {
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session?.access_token) throw new Error("Session expired. Please login again.");
-
-      await createSubUserWithoutServiceRole(supabase, {
+      await executeTask({
+        action: 'create_sub_user',
         email: newSubUserEmail,
         password: newSubUserPassword,
         roleTag: newSubUserRoleTag,
         role: newSubUserRole,
-        permissions: newSubUserPermissions,
+        permissions: newSubUserPermissions as any,
       });
 
       toast.success(`Staff member ${newSubUserRoleTag} created successfully!`);
@@ -1772,157 +1772,40 @@ EzyIntern Team`;
     const metadata = lead.metadata || {};
     setProcessing(true);
     try {
-      // 1. Create a secondary client
-      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
-      const supabaseAnonKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
-      const transferClient = createClient(supabaseUrl, supabaseAnonKey, {
-        auth: {
-          persistSession: false,
-          autoRefreshToken: false,
-          detectSessionInUrl: false,
-          storage: {
-            getItem: () => null,
-            setItem: () => {},
-            removeItem: () => {},
-          }
-        }
-      });
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) throw new Error("Session expired. Please login again.");
 
-      // 2. Sign up
-      let userId: string | undefined;
-      const { data: authData, error: authError } = await transferClient.auth.signUp({
-        email: leadEmail,
-        password: password,
-        options: {
-          data: { full_name: leadName }
-        }
-      });
+      const rawAmount = lead.amount_paise || lead.amount || 9900;
+      const amountRupees = rawAmount > 50000 ? rawAmount / 100 : rawAmount; // convert if in paise
 
-      if (authError) {
-        if (authError.message.toLowerCase().includes("already registered") || authError.message.toLowerCase().includes("already exists")) {
-          const { data: existingProfile } = await supabase
-            .from("profiles")
-            .select("id")
-            .eq("email", leadEmail)
-            .maybeSingle();
-          
-          if (existingProfile) {
-            userId = existingProfile.id;
-          } else {
-            const { data: rpcUserId, error: rpcError } = await supabase.rpc('get_user_id_by_email', { email_text: leadEmail });
-            if (!rpcError && rpcUserId) {
-              userId = rpcUserId;
-            } else {
-              throw new Error("User is registered in Auth but has no profile and search failed. Please run the SQL fix.");
-            }
-          }
-        } else {
-          throw authError;
-        }
-      } else {
-        userId = authData.user?.id;
-      }
-
-      if (!userId) throw new Error("Failed to create or find auth user");
-
-      // 3. Registration ID
-      const { data: latestStudents } = await supabase
-        .from("students")
-        .select("registration_id")
-        .not("registration_id", "is", null)
-        .order("created_at", { ascending: false })
-        .limit(10);
-
-      let nextSeq = 10001;
-      if (latestStudents && latestStudents.length > 0) {
-        const seqs = latestStudents.map(s => {
-          const parts = s.registration_id.split('/');
-          // Format: EZY/YEAR/INT/SEQ
-          return parts.length === 4 ? parseInt(parts[3], 10) : 0;
-        }).filter(n => !isNaN(n));
-        if (seqs.length > 0) {
-          nextSeq = Math.max(...seqs) + 1;
-        }
-      }
-      
-      const currentYear = new Date().getFullYear();
-      let regId = `EZY/${currentYear}/INT/${nextSeq}`;
-
-      // 4. Student Data with Collision Protection Loop
-      let studentError = null;
-      let retryCount = 0;
-
-      const enrichedMeta = { ...(typeof metadata === "object" && metadata !== null ? metadata : {}), password };
-
-      const studentDataPayload: any = {
-        id: userId,
-        email: leadEmail,
-        full_name: leadName,
-        gender: metadata.gender,
-        parent_name: metadata.parentName,
-        contact_number: lead.user_phone || metadata.contact,
-        university_name: lead.university_name || metadata.university,
-        college_name: lead.college_name || metadata.college,
-        course: metadata.course,
-        internship_domain: metadata.course,
-        degree: metadata.degree,
-        department: metadata.department,
-        class_semester: metadata.semester,
-        academic_session: metadata.session,
-        roll_number: metadata.rollNo,
-        emergency_name: metadata.emName,
-        emergency_contact: metadata.emPhone,
-        emergency_relation: metadata.emRel,
-        status: 'Active',
-        cybercafe_shop_name: lead.cybercafe_shop_name,
-        cybercafe_email: lead.cybercafe_email,
-        password,
-        metadata: enrichedMeta,
+      const payload = {
+        admin_id: session.user.id,
+        student_data: {
+          email: String(leadEmail).trim().toLowerCase(),
+          full_name: leadName,
+          gender: metadata.gender,
+          parent_name: metadata.parentName,
+          contact_number: lead.user_phone || metadata.contact || "",
+          university_name: lead.university_name || metadata.university || "",
+          college_name: lead.college_name || metadata.college || "",
+          course: metadata.course,
+          internship_domain: metadata.course,
+          degree: metadata.degree,
+          department: metadata.department,
+          class_semester: metadata.semester,
+          academic_session: metadata.session,
+          roll_number: metadata.rollNo,
+          emergency_name: metadata.emName,
+          emergency_contact: metadata.emPhone,
+          emergency_relation: metadata.emRel,
+          password,
+        },
+        payment_amount: amountRupees,
+        transaction_id: `ADMIN_TRANS_${Math.random().toString(36).substring(2, 10).toUpperCase()}`
       };
 
-      while (retryCount < 10) {
-        studentDataPayload.registration_id = regId;
-        const { error } = await supabase.from("students").upsert(studentDataPayload);
-        
-        if (error) {
-          if (error.code === '23505' && (error.message.includes('registration_id') || error.detail?.includes('registration_id'))) {
-            nextSeq++;
-            regId = `EZY/${currentYear}/INT/${nextSeq}`;
-            retryCount++;
-            continue;
-          }
-          studentError = error;
-        } else {
-          studentError = null;
-        }
-        break;
-      }
-
-      if (studentError) throw studentError;
-
-      // 5. Profile & Role
-      await adminUpsertStudentProfile(supabase, {
-        id: userId,
-        full_name: leadName,
-        email: String(leadEmail).trim().toLowerCase(),
-        contact_number: lead.user_phone || metadata.contact,
-        gender: metadata.gender,
-        parent_name: metadata.parentName,
-      });
-      
-      await supabase.from("user_roles").upsert({ user_id: userId, role: "student" }, { onConflict: 'user_id,role' });
-
-      // 5.5 Create Payment Entry (Transaction)
-      const { error: paymentError } = await supabase.from("payment_success").insert({
-        user_id: userId,
-        payment_id: `ADMIN_TRANS_${Math.random().toString(36).substring(2, 10).toUpperCase()}`,
-        amount_paise: lead.amount_paise || lead.amount || 9900,
-        email: leadEmail,
-        full_name: leadName,
-        college_name: lead.college_name || metadata.college,
-        status: 'success'
-      });
-      if (paymentError) console.error("Payment log error:", paymentError);
+      const result = await registerStudent(payload);
+      const userId = result?.data?.userId;
 
       // 6. Cleanup
       if (lead.registration_draft && lead.draft_id) {

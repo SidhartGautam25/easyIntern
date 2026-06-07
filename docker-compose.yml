@@ -1,0 +1,152 @@
+x-json-logging: &json-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+    mode: non-blocking
+    max-buffer-size: "4m"
+
+services:
+  redis:
+    image: redis:alpine
+    container_name: ezyintern-redis
+    ports:
+      - "6379:6379"
+    restart: always
+    volumes:
+      - redis_data:/data
+    networks:
+      - app
+    logging: *json-logging
+
+  backend:
+    build:
+      context: ./updatedeasy/server
+      dockerfile: Dockerfile
+    container_name: ezyintern-backend
+    ports:
+      - "5000:5000"
+    restart: always
+    depends_on:
+      - redis
+    environment:
+      - PORT=5000
+      - NODE_ENV=${NODE_ENV:-production}
+      - SERVICE_NAME=ezyintern-server
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - SLOW_REQUEST_MS=${SLOW_REQUEST_MS:-1000}
+      - SLOW_OPERATION_MS=${SLOW_OPERATION_MS:-1000}
+      - REDIS_URL=redis://redis:6379
+      # Pass through env variables from host shell or root .env
+      - DATABASE_URL=${DATABASE_URL}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - RAZORPAY_KEY_ID=${RAZORPAY_KEY_ID}
+      - RAZORPAY_KEY_SECRET=${RAZORPAY_KEY_SECRET}
+      - RAZORPAY_WEBHOOK_SECRET=${RAZORPAY_WEBHOOK_SECRET}
+      - SMTP_HOST=${SMTP_HOST}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USER=${SMTP_USER}
+      - SMTP_PASS=${SMTP_PASS}
+    labels:
+      ezyintern.logging: "enabled"
+      ezyintern.service: "backend"
+    networks:
+      - app
+      - observability
+    logging: *json-logging
+
+  client:
+    build:
+      context: ./easyintern
+      dockerfile: Dockerfile
+      args:
+        - VITE_SUPABASE_PROJECT_ID=${VITE_SUPABASE_PROJECT_ID:-unqfphgjilxpbzajcdjl}
+        - VITE_SUPABASE_PUBLISHABLE_KEY=${VITE_SUPABASE_PUBLISHABLE_KEY:-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVucWZwaGdqaWx4cGJ6YWpjZGpsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzczNzYxMjUsImV4cCI6MjA5Mjk1MjEyNX0.lgQXDkliN603WXSENd_odb6ndg6urW8UaaKP7wf1fTU}
+        - VITE_SUPABASE_URL=${VITE_SUPABASE_URL:-https://unqfphgjilxpbzajcdjl.supabase.co}
+        - VITE_BACKEND_URL=${VITE_BACKEND_URL:-http://localhost:5000}
+        - VITE_REGISTRATION_USE_ORDER_API=${VITE_REGISTRATION_USE_ORDER_API:-true}
+    container_name: ezyintern-client
+    ports:
+      - "80:80"
+    restart: always
+    depends_on:
+      - backend
+    networks:
+      - app
+    logging: *json-logging
+
+  loki:
+    image: grafana/loki:${LOKI_VERSION:-3.5}
+    container_name: ezyintern-loki
+    command:
+      - -config.file=/etc/loki/loki.yml
+      - -config.expand-env=true
+    ports:
+      - "127.0.0.1:${LOKI_PORT:-3100}:3100"
+    restart: unless-stopped
+    environment:
+      - LOKI_RETENTION_PERIOD=${LOKI_RETENTION_PERIOD:-168h}
+    volumes:
+      - ./observability/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+    networks:
+      - observability
+    logging: *json-logging
+
+  alloy:
+    image: grafana/alloy:${ALLOY_VERSION:-v1.16.0}
+    container_name: ezyintern-alloy
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "127.0.0.1:${ALLOY_PORT:-12345}:12345"
+    restart: unless-stopped
+    depends_on:
+      - loki
+      - backend
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - alloy_data:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - observability
+    logging: *json-logging
+
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION:-13.0.0}
+    container_name: ezyintern-grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    restart: unless-stopped
+    depends_on:
+      - loki
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_LOG_MODE=console
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - observability
+    logging: *json-logging
+
+networks:
+  app:
+    driver: bridge
+  observability:
+    driver: bridge
+
+volumes:
+  redis_data:
+  loki_data:
+  alloy_data:
+  grafana_data:

@@ -18,7 +18,8 @@ import { buildStudentCredentialLoginLink } from "@/lib/authRoutes";
 import { captureReferralFromUrl, peekStoredReferralCode, resolveValidReferralCode, logReferralClickFromUrl } from "@/lib/referral";
 import { formatRupees, isLnmuStudent } from "@/lib/feeRules";
 import { resolveStudentFeeBreakdown } from "@/lib/collegeFees";
-import { runClientRazorpayCheckout } from "@/lib/clientRazorpayPayment";
+import { runRegistrationRazorpayCheckout } from "@/lib/registrationPayment";
+import { usePayment, useAdmin } from "@/hooks/useBackend";
 import { loadRazorpayCheckout } from "@/lib/razorpayCheckout";
 import { baSubjects, bcomSubjects, bscSubjects } from "@/lib/subjectOptions";
 import { displayCollegeName } from "@/lib/collegeDisplay";
@@ -113,6 +114,8 @@ export const RegistrationForm = ({
   onAdminComplete?: (info: { email: string; full_name: string }) => void;
 }) => {
   const navigate = useNavigate();
+  const { pollOrderStatus } = usePayment();
+  const { registerStudent } = useAdmin();
   const isAdminVariant = variant === "admin";
   const isCyberCafeVariant = variant === "cybercafe";
   const [step, setStep] = useState<Step>(1);
@@ -485,25 +488,67 @@ export const RegistrationForm = ({
     );
     const finalAmount = breakdown.totalPaise;
 
-    const payResult = await runClientRazorpayCheckout({
-      paymentSettings,
-      amountPaise: finalAmount,
-      prefill: { name: fullName, email: email.trim(), contact },
-    });
-
-    if (!payResult.success) {
-      if (!payResult.cancelled) {
-        toast.error("Payment failed. Please try again.");
-      }
-      return { success: false };
+    const selectedUniName = selectedUni?.name || "";
+    const meta: Record<string, unknown> = { subject, internship_mode: internshipMode };
+    if (isLnmuStudent(selectedUniName) && consentFormUrlRef.current) {
+      meta.consent_form_url = consentFormUrlRef.current;
     }
 
-    return {
-      success: true,
-      payment_id: payResult.payment_id,
-      amount: payResult.amount,
-      mode: "legacy" as const,
+    const cyberData = JSON.parse(sessionStorage.getItem('cybercafe_profile') || '{}');
+
+    const studentData = {
+      fullName: fullName.trim(),
+      gender: gender as any,
+      parentName: parentName.trim(),
+      contact: contact.trim(),
+      email: email.trim().toLowerCase(),
+      universityId,
+      collegeId,
+      degree,
+      departmentName: departmentName.trim() || undefined,
+      classSem,
+      session,
+      subject: subject.trim() || undefined,
+      rollNo,
+      course,
+      internshipMode: internshipMode as any,
+      emName: emName.trim() || undefined,
+      emPhone: emPhone.trim() || undefined,
+      emRel: emRel.trim() || undefined,
+      password,
+      consentFormUrl: consentFormUrlRef.current || undefined,
+      referralCode: peekStoredReferralCode() || undefined,
+      metadata: meta,
     };
+
+    try {
+      const payResult = await runRegistrationRazorpayCheckout({
+        paymentSettings,
+        amountPaise: finalAmount,
+        prefill: { name: fullName, email: email.trim(), contact },
+        studentData,
+      });
+
+      if (!payResult.success) {
+        const isCancelled = (payResult as { success: false; cancelled?: boolean }).cancelled;
+        if (!isCancelled) {
+          toast.error("Payment failed. Please try again.");
+        }
+        return { success: false };
+      }
+
+      return {
+        success: true,
+        payment_id: payResult.payment_id,
+        amount: payResult.amount,
+        mode: payResult.mode,
+        orderId: (payResult.mode === "verified" ? payResult.orderId : undefined) || "",
+        userId: payResult.mode === "verified" ? payResult.userId : undefined,
+      };
+    } catch (err: any) {
+      toast.error(err.message || "Payment process encountered an error.");
+      return { success: false };
+    }
   };
 
   const submit = async () => {
@@ -548,156 +593,34 @@ export const RegistrationForm = ({
       const selectedCollege = colleges.find((c) => c.id === collegeId);
       const selectedUni = unis.find((u) => u.id === universityId);
 
-      const ephemeral = createEphemeralSupabaseAuthClient();
-      const { data: authData, error: authError } = await ephemeral.auth.signUp({
-        email: normalizedEmail,
-        password,
-        options: { data: { full_name: fullName } },
-      });
-
-      if (authError) {
-        const low = authError.message.toLowerCase();
-        if (
-          low.includes("already registered") ||
-          low.includes("already exists") ||
-          authError.code === "user_already_exists"
-        ) {
-          throw new Error(
-            "This email is already registered. Use a different email or find the student in the directory to edit their profile."
-          );
-        }
-        throw authError;
-      }
-
-      const userId = authData.user?.id;
-      if (!userId) {
-        throw new Error(
-          "Signup did not return a user id. In Supabase Auth, turn off email confirmation for signups or confirm the account, then retry."
-        );
-      }
-
-      const { data: latestStudents } = await supabase
-        .from("students")
-        .select("registration_id")
-        .not("registration_id", "is", null)
-        .order("created_at", { ascending: false })
-        .limit(10);
-
-      let nextSeq = 10001;
-      if (latestStudents && latestStudents.length > 0) {
-        const seqs = latestStudents
-          .map((s) => {
-            const parts = s.registration_id.split("/");
-            return parts.length === 4 ? parseInt(parts[3], 10) : 0;
-          })
-          .filter((n) => !isNaN(n));
-        if (seqs.length > 0) nextSeq = Math.max(...seqs) + 1;
-      }
-      const currentYear = new Date().getFullYear();
-      let regId = `EZY/${currentYear}/INT/${nextSeq}`;
-
-      const cyberData = JSON.parse(sessionStorage.getItem("cybercafe_profile") || "{}");
-
-      const basePayload = {
-        id: userId,
-        email: normalizedEmail,
-        full_name: fullName,
-        gender,
-        parent_name: parentName,
-        contact_number: contact,
-        university_name: selectedUni?.name || "",
-        college_name: displayCollegeName(selectedCollege?.name) || "",
-        course,
-        internship_domain: course,
-        degree,
-        department: departmentName,
-        class_semester: classSem,
-        academic_session: session,
-        roll_number: rollNo,
-        emergency_name: emName,
-        emergency_contact: emPhone,
-        emergency_relation: emRel,
-        status: "Active" as const,
-        cybercafe_shop_name: cyberData.shop_name || null,
-        cybercafe_email: cyberData.email || null,
-        metadata: {
-          source: "admin_manual_registration",
-          subject,
-          fullName: fullName,
-          parentName: parentName,
+      const payload = {
+        admin_id: sessionWrap.session.user.id,
+        student_data: {
+          email: normalizedEmail,
+          full_name: fullName,
           gender,
-          contact,
-          university: selectedUni?.name || "",
-          college: selectedCollege?.name || "",
+          parent_name: parentName,
+          contact_number: contact,
+          university_name: selectedUni?.name || "",
+          college_name: displayCollegeName(selectedCollege?.name) || "",
+          course,
+          internship_domain: course,
           degree,
           department: departmentName,
-          session,
-          semester: classSem,
-          rollNo,
-          course,
-          internship_mode: internshipMode,
+          class_semester: classSem,
+          academic_session: session,
+          roll_number: rollNo,
+          emergency_name: emName,
+          emergency_contact: emPhone,
+          emergency_relation: emRel,
+          password,
+          subject,
         },
+        payment_amount: 0,
+        transaction_id: `pay_admin_${Date.now()}`
       };
 
-      const studentDataPayload = withStoredDirectoryPassword(basePayload, password);
-
-      let retryCount = 0;
-      while (retryCount < 10) {
-        studentDataPayload.registration_id = regId;
-        const { error } = await supabase.from("students").upsert(studentDataPayload);
-        if (error) {
-          if (error.code === "23505" && (error.message.includes("registration_id") || error.detail?.includes("registration_id"))) {
-            nextSeq++;
-            regId = `EZY/${currentYear}/INT/${nextSeq}`;
-            retryCount++;
-            continue;
-          }
-          throw error;
-        }
-        break;
-      }
-
-      await adminUpsertStudentProfile(supabase, {
-        id: userId,
-        full_name: fullName,
-        email: normalizedEmail,
-        contact_number: contact,
-        gender,
-        parent_name: parentName,
-      });
-
-      await supabase.from("user_roles").upsert({ user_id: userId, role: "student" }, { onConflict: "user_id,role" });
-
-      await supabase.from("payment_success").insert({
-        user_id: userId,
-        payment_id: `pay_admin_${Date.now()}`,
-        amount_paise: 0,
-        email: normalizedEmail,
-        full_name: fullName,
-        college_name: displayCollegeName(selectedCollege?.name) || "",
-        status: "success",
-      });
-
-      try {
-        const mailRes = await fetch(getSendMailApiUrl(), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            to: normalizedEmail,
-            email: normalizedEmail,
-            action: "registration_success",
-            data: {
-              fullName,
-              regId,
-              password,
-              loginLink: buildStudentCredentialLoginLink(window.location.origin),
-            },
-          }),
-        });
-        await assertSendMailOk(mailRes);
-      } catch {
-        /* optional welcome mail */
-      }
+      await registerStudent(payload);
 
       toast.success("Student added successfully.");
       onAdminComplete?.({ email: normalizedEmail, full_name: fullName });
@@ -730,25 +653,22 @@ export const RegistrationForm = ({
 
       const isLegacyPaidFlow = paymentSettings?.is_active && result?.mode === "legacy";
       if (paymentSettings?.is_active && !isLegacyPaidFlow) {
-        // Server verify inserts student row — slight replication lag can yield empty reads.
-        let enrolled: { id: string; registration_id: string | null } | null = null;
-        for (let attempt = 0; attempt < 12; attempt++) {
-          const { data } = await supabase
-            .from("students")
-            .select("id, registration_id")
-            .eq("email", normalizedEmail)
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
-          if (data?.id) {
-            enrolled = data;
-            break;
-          }
-          await new Promise((r) => setTimeout(r, 450));
+        toast.info("Payment verified. Setting up your account, please wait...");
+        const pollRes = await pollOrderStatus(result.orderId);
+        regId = pollRes.registrationId || "";
+
+        // Retrieve the created student ID (userId) from Supabase
+        const { data: studentRecord } = await supabase
+          .from("students")
+          .select("id")
+          .eq("email", normalizedEmail)
+          .maybeSingle();
+        userId = studentRecord?.id;
+
+        if (!userId) {
+          throw new Error("Enrollment finished but account details could not be loaded. Please sign in.");
         }
-        userId = enrolled?.id;
-        regId = enrolled?.registration_id || "";
-        if (!userId) throw new Error("Payment captured but enrollment not completed. Please contact support.");
+
         if (validReferral && userId) {
           const { error: refErr } = await supabase
             .from("students")
@@ -974,7 +894,7 @@ export const RegistrationForm = ({
       {step === 1 && (
         <div className="space-y-4 animate-fade-in">
           <div className="grid sm:grid-cols-2 gap-4">
-            <div className="space-y-1.5"><Label className="text-xs">Full Name *</Label><Input value={fullName} onChange={(e) => setFullName(e.target.value)} bsSize="sm" /></div>
+            <div className="space-y-1.5"><Label className="text-xs">Full Name *</Label><Input value={fullName} onChange={(e) => setFullName(e.target.value)} /></div>
             <div className="space-y-1.5">
               <Label className="text-xs">Gender *</Label>
               <RadioGroup value={gender} onValueChange={setGender} className="flex gap-4 pt-1">
