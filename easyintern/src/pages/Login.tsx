@@ -13,6 +13,7 @@ import {
   STUDENT_LOGIN_PATH,
 } from "@/lib/authRoutes";
 import { getSendMailApiUrl } from "@/lib/sendMailApi";
+import { useAuthBackend } from "@/hooks/useBackend";
 import { resolveLoginIdentifier } from "@/lib/resolveLoginIdentifier";
 import type { User } from "@supabase/supabase-js";
 import { Button } from "@/components/ui/button";
@@ -57,6 +58,7 @@ async function resolveDashboardPath(user: User): Promise<string> {
 const Login = () => {
   const navigate = useNavigate();
   const location = useLocation();
+  const { requestOtp, resetPassword } = useAuthBackend();
   const isCyberCafeLoginRoute =
     location.pathname === CYBER_CAFE_LOGIN_PATH ||
     location.pathname === CYBER_CAFE_LEGACY_LOGIN_PATH;
@@ -368,79 +370,7 @@ const Login = () => {
       const normalizedEmail = resolved.email;
       setResetEmail(normalizedEmail);
 
-      const { data: registered, error: regErr } = await supabase.rpc(
-        'auth_email_registered_for_reset',
-        { p_identifier: identifierInput }
-      );
-      if (regErr) {
-        const msg = String(regErr.message || '').toLowerCase();
-        if (msg.includes('could not find') || regErr.code === 'PGRST202') {
-          throw new Error(
-            'Password reset is not set up on the database yet. Run supabase/migrations/20260519100000_fix_password_reset_and_staff_search.sql in Lovable SQL.'
-          );
-        }
-        throw regErr;
-      }
-      if (!registered) {
-        throw new Error(
-          resolved.usedPhone
-            ? 'No account found for this phone number. It must match the mobile on your profile.'
-            : 'No account found for this email. Use the same email you use to sign in.'
-        );
-      }
-
-      const generatedOtp = Math.floor(100000 + Math.random() * 900000).toString();
-
-      // Lovable / managed Supabase + Vercel SMTP-only: store OTP from the browser (anon key),
-      // send email via /api/send-mail (no service_role on Vercel needed).
-      const { error: insertError } = await supabase.from('password_resets').insert({
-        email: normalizedEmail,
-        otp: generatedOtp,
-      });
-
-      if (!insertError) {
-        const response = await fetch(getSendMailApiUrl(), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'send_otp',
-            otp: generatedOtp,
-            to: normalizedEmail,
-            email: normalizedEmail,
-          }),
-        });
-        const result = await response.json().catch(() => ({}));
-        if (!response.ok || !result.success) {
-          const detail = [result.message, result.error].filter(Boolean).join(' ');
-          throw new Error(detail || 'Failed to send OTP');
-        }
-      } else {
-        // Optional: server inserts OTP + sends mail if SUPABASE_SERVICE_ROLE_KEY is configured.
-        const serverRes = await fetch('/api/auth/forgot-password', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'request_otp', email: normalizedEmail }),
-        });
-        const serverJson = await serverRes.json().catch(() => ({}));
-        if (!serverRes.ok || !serverJson.success) {
-          throw new Error(
-            [
-              insertError.message,
-              serverJson.message,
-              serverJson.hint,
-              'In Lovable Cloud → SQL: run supabase/custom_otp_reset.sql so anon can INSERT into password_resets (and drop restrictive password_resets policies if needed).',
-            ]
-              .filter(Boolean)
-              .join(' ')
-          );
-        }
-      }
-
-      toast.success(
-        resolved.usedPhone
-          ? `OTP sent to ${normalizedEmail} (email linked to this phone).`
-          : 'OTP sent to your email.'
-      );
+      await requestOtp(normalizedEmail);
       setResetStep("otp");
     } catch (error: any) {
       toast.error(error.message || 'Failed to send OTP');
@@ -455,24 +385,7 @@ const Login = () => {
       toast.error("Please enter your 6-digit OTP");
       return;
     }
-    setResetLoading(true);
-    try {
-      const { data: valid, error: verifyErr } = await supabase.rpc('verify_password_reset_otp', {
-        p_identifier: resetEmail.trim(),
-        p_otp: otp,
-      });
-      if (verifyErr) throw verifyErr;
-      if (!valid) {
-        throw new Error('Invalid or expired OTP. Request a new code and try again.');
-      }
-      setResetOtp(otp);
-      setResetStep("password");
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : 'OTP verification failed';
-      toast.error(message);
-    } finally {
-      setResetLoading(false);
-    }
+    setResetStep("password");
   };
 
   const handleUpdatePassword = async () => {
@@ -482,32 +395,7 @@ const Login = () => {
     }
     setResetLoading(true);
     try {
-      const { data: rpcOk, error: rpcError } = await supabase.rpc('reset_user_password', {
-        p_identifier: resetEmail.trim(),
-        p_otp: resetOtp.trim(),
-        p_new_password: newPassword.trim(),
-      });
-
-      if (rpcError) {
-        const msg = String(rpcError.message || '').toLowerCase();
-        const rpcMissing =
-          msg.includes('could not find') ||
-          msg.includes('404') ||
-          msg.includes('not found') ||
-          rpcError.code === 'PGRST202';
-
-        if (rpcMissing) {
-          throw new Error(
-            'Password reset is not set up on the database yet. In Lovable Cloud open SQL and run the full repo file supabase/custom_otp_reset.sql (creates reset_user_password + pgcrypto). No Vercel Supabase keys needed.'
-          );
-        }
-        throw rpcError;
-      }
-
-      if (!rpcOk) {
-        throw new Error('Invalid/expired OTP or user not found.');
-      }
-
+      await resetPassword(resetEmail.trim(), resetOtp.trim(), newPassword.trim());
       toast.success("Password updated successfully! You can now login.");
       setShowResetDialog(false);
       setResetStep("email");
