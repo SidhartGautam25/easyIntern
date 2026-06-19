@@ -53,8 +53,10 @@ export class PaymentService {
     }
   }
 
-  private async getRazorpayInstance(): Promise<{ instance: Razorpay; keyId: string; webhookSecret: string }> {
-    const dbConfig = await this.collegeRepo.findPaymentConfig();
+  private async getRazorpayInstance(): Promise<{ instance: Razorpay; keyId: string; keySecret: string; webhookSecret: string }> {
+    const useEnv = config.nodeEnv === 'development' || config.nodeEnv === 'test' || process.env.USE_ENV_PAYMENT_CONFIG === 'true';
+    const dbConfig = useEnv ? null : await this.collegeRepo.findPaymentConfig();
+
     const keyId = dbConfig?.razorpay_key_id || process.env.RAZORPAY_KEY_ID || '';
     const keySecret = dbConfig?.razorpay_key_secret || process.env.RAZORPAY_KEY_SECRET || '';
     const webhookSecret = dbConfig?.razorpay_webhook_secret || process.env.RAZORPAY_WEBHOOK_SECRET || '';
@@ -68,7 +70,7 @@ export class PaymentService {
       key_secret: keySecret,
     });
 
-    return { instance, keyId, webhookSecret };
+    return { instance, keyId, keySecret, webhookSecret };
   }
 
   async createRegistrationOrder(studentData: any, amountPaise: number) {
@@ -100,7 +102,18 @@ export class PaymentService {
       },
     };
 
-    const rzpOrder = await instance.orders.create(orderOptions);
+    let rzpOrder;
+    try {
+      rzpOrder = await instance.orders.create(orderOptions);
+    } catch (err: any) {
+      logger.error(withErrorCategory('payment', { error: err }), 'Razorpay order creation failed');
+      const status = err.statusCode || err.status || 500;
+      const errorMsg = err.error?.description || err.message || 'Failed to create order on payment gateway.';
+      const customErr = new Error(errorMsg) as any;
+      customErr.status = status === 401 ? 401 : 500;
+      throw customErr;
+    }
+
     if (!rzpOrder || !rzpOrder.id) {
       throw new Error('Failed to create order on payment gateway.');
     }
@@ -138,9 +151,7 @@ export class PaymentService {
   }
 
   async verifyClientSignature(orderId: string, paymentId: string, clientSignature: string) {
-    await this.getRazorpayInstance();
-    // In Razorpay, the signature secret is the key_secret for verify signatures!
-    const keySecret = (await this.collegeRepo.findPaymentConfig())?.razorpay_key_secret || process.env.RAZORPAY_KEY_SECRET || '';
+    const { keySecret } = await this.getRazorpayInstance();
 
     const text = `${orderId}|${paymentId}`;
     const generatedSig = crypto
@@ -156,7 +167,9 @@ export class PaymentService {
         outcome: 'failure',
         paymentId,
       });
-      throw new Error('Invalid signature. Verification failed.');
+      const err = new Error('Invalid signature. Verification failed.') as any;
+      err.status = 400;
+      throw err;
     }
 
     audit({

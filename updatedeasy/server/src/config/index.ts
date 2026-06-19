@@ -5,7 +5,13 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Load .env from root of server
+// Detect environment (default to development)
+const nodeEnv = process.env.NODE_ENV || 'development';
+
+// Load environment-specific file first (e.g. .env.development or .env.production)
+dotenv.config({ path: path.resolve(__dirname, `../../.env.${nodeEnv}`) });
+
+// Fallback to generic .env
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
 export const config = {

@@ -1,7 +1,8 @@
 import axios from 'axios';
 import { supabase } from '@/integrations/supabase/client';
 
-const VITE_BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+const rawBackendUrl = import.meta.env.VITE_BACKEND_URL || 'http://localhost:5000';
+const VITE_BACKEND_URL = rawBackendUrl.endsWith('/api') ? rawBackendUrl : `${rawBackendUrl.replace(/\/$/, '')}/api`;
 
 export class ApiError extends Error {
   constructor(
