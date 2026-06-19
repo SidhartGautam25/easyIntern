@@ -66,8 +66,8 @@ loki.process "ezyintern_pino" {
 
   stage.timestamp {
     source            = "time"
-    format            = "RFC3339"
-    action_on_failure = "skip"
+    format            = "RFC3339Nano"
+    action_on_failure = "fudge"
   }
 
   stage.labels {
