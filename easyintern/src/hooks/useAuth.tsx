@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import { User } from '@supabase/supabase-js';
+import { apiClient } from '@/lib/apiClient';
 
 export type UserRole = 'super_admin' | 'admin' | 'staff' | 'student' | 'cybercafe' | 'college_admin' | 'referral_partner';
 
@@ -57,7 +58,32 @@ export const useAuth = () => {
 
     checkAuth();
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    let lastEvent: string | null = null;
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (event === 'SIGNED_IN' && lastEvent !== 'SIGNED_IN') {
+        lastEvent = 'SIGNED_IN';
+        try {
+          await apiClient.post('/auth/log-event', {
+            action: 'user.login',
+            outcome: 'success',
+            details: { email: session?.user?.email }
+          });
+        } catch (err) {
+          console.warn('Failed to send login audit log:', err);
+        }
+      } else if (event === 'SIGNED_OUT' && lastEvent !== 'SIGNED_OUT') {
+        lastEvent = 'SIGNED_OUT';
+        try {
+          await apiClient.post('/auth/log-event', {
+            action: 'user.logout',
+            outcome: 'success'
+          });
+        } catch (err) {
+          console.warn('Failed to send logout audit log:', err);
+        }
+      }
+
       if (session) {
         setUser(session.user);
         checkAuth(); // Re-fetch roles on login
@@ -68,7 +94,18 @@ export const useAuth = () => {
       }
     });
 
-    return () => subscription.unsubscribe();
+    // Listen for storage changes (for same-tab updates)
+    const updateStatus = () => {
+      // placeholder update logic if needed
+    };
+    window.addEventListener('storage', updateStatus);
+    const interval = setInterval(updateStatus, 1000); // Polling as fallback for sessionStorage
+
+    return () => {
+      subscription.unsubscribe();
+      window.removeEventListener('storage', updateStatus);
+      clearInterval(interval);
+    };
   }, []);
 
   return { user, roles, loading };
