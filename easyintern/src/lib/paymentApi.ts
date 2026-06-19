@@ -65,5 +65,6 @@ export async function paymentGetStatus(orderId: string): Promise<{ ok: boolean; 
  */
 export function getPaymentWebhookUrl(): string {
   const fromEnv = import.meta.env.VITE_BACKEND_URL || "http://localhost:5000";
-  return `${fromEnv.replace(/\/$/, "")}/payment/webhook`;
+  const base = fromEnv.endsWith('/api') ? fromEnv : `${fromEnv.replace(/\/$/, '')}/api`;
+  return `${base}/payment/webhook`;
 }

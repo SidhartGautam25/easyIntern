@@ -37,7 +37,10 @@ const requestContext = new AsyncLocalStorage<RequestLogContext>();
 const redactPaths = [
   'authorization',
   'cookie',
-  'set-cookie',
+  '["set-cookie"]',
+  'headers["set-cookie"]',
+  'req.headers["set-cookie"]',
+  'request.headers["set-cookie"]',
   'password',
   'newPassword',
   'passwordToSet',

@@ -13,14 +13,18 @@ out/
 **/out/
 
 # Environment variables & local secrets
-# .env
-# .env.local
-# .env.development.local
-# .env.test.local
-# .env.production.local
-# **/.env
-# **/.env.local
-# **/.env.*.local
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+**/.env
+**/.env.local
+**/.env.development
+**/.env.production
+**/.env.*.local
+
+
 
 # Logs and diagnostics
 npm-debug.log*

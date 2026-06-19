@@ -34,7 +34,7 @@ export class PaymentController {
     ctx.status = 200;
     ctx.body = {
       success: true,
-      data: result,
+      ...result,
     };
   };
 

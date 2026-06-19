@@ -26,8 +26,19 @@ function envRazorpayKeyId(): string {
 export function normalizePaymentSettings(
   raw: PublicPaymentSettings | null | undefined
 ): PublicPaymentSettings | null {
+  const envKey = envRazorpayKeyId();
+  const isDev = import.meta.env.DEV || import.meta.env.MODE === 'development';
+
+  if (isDev && envKey) {
+    return {
+      razorpay_key_id: envKey,
+      is_active: true,
+      amount_paise: raw?.amount_paise || 9900,
+      currency: raw?.currency || "INR",
+    };
+  }
+
   if (!raw) {
-    const envKey = envRazorpayKeyId();
     if (!envKey) return null;
     return {
       razorpay_key_id: envKey,
@@ -37,13 +48,14 @@ export function normalizePaymentSettings(
     };
   }
 
-  const key = String(raw.razorpay_key_id || "").trim() || envRazorpayKeyId();
+  const key = String(raw.razorpay_key_id || "").trim() || envKey;
   return {
     ...raw,
     razorpay_key_id: key || raw.razorpay_key_id,
     is_active: raw.is_active === false ? false : true,
   };
 }
+
 
 /** Read payment settings for checkout (public RPC or safe view only — never payment_config secrets). */
 export async function fetchPublicPaymentConfig(
@@ -193,15 +205,17 @@ export async function runRegistrationRazorpayCheckout(opts: {
       scriptReady,
     ]);
 
-    if (!orderRes || !orderRes.ok || orderRes.data.success !== true) {
-      const errorMsg = orderRes?.data?.message || "Failed to create secure payment order on server.";
+    const responseData = orderRes.data as any;
+    if (!orderRes || !orderRes.ok || responseData.success !== true) {
+      const errorMsg = responseData.message || "Failed to create secure payment order on server.";
       throw new Error(String(errorMsg));
     }
 
-    const orderId = String(orderRes.data.orderId || "");
-    const orderKey = String(orderRes.data.key || key);
-    const orderAmount = Number(orderRes.data.amount) || amountPaise;
-    const currency = String(orderRes.data.currency || settings?.currency || "INR");
+    const nestedData = responseData.data || {};
+    const orderId = String(responseData.orderId || nestedData.orderId || "");
+    const orderKey = String(responseData.key || nestedData.key || nestedData.keyId || key);
+    const orderAmount = Number(responseData.amount || nestedData.amount) || amountPaise;
+    const currency = String(responseData.currency || nestedData.currency || settings?.currency || "INR");
 
     if (orderId) {
       const checkoutImage = "/logo.png";
