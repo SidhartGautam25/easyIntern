@@ -26,7 +26,7 @@ export const studentRegistrationSchema = z.object({
 
 export const createOrderSchema = z.object({
   studentData: studentRegistrationSchema,
-  amount: z.number().positive(),
+  amount: z.number().min(100, 'Minimum amount is 100 paise'),
 });
 
 export const verifyPaymentSchema = z.object({

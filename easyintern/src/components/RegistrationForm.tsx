@@ -656,14 +656,7 @@ export const RegistrationForm = ({
         toast.info("Payment verified. Setting up your account, please wait...");
         const pollRes = await pollOrderStatus(result.orderId);
         regId = pollRes.registrationId || "";
-
-        // Retrieve the created student ID (userId) from Supabase
-        const { data: studentRecord } = await supabase
-          .from("students")
-          .select("id")
-          .eq("email", normalizedEmail)
-          .maybeSingle();
-        userId = studentRecord?.id;
+        userId = pollRes.userId;
 
         if (!userId) {
           throw new Error("Enrollment finished but account details could not be loaded. Please sign in.");
@@ -820,20 +813,30 @@ export const RegistrationForm = ({
       onSuccess?.();
 
       if (!isCyberCafeVariant && !isAdminVariant) {
+        console.log("[Registration] Starting post-registration sign-in for:", normalizedEmail);
         let hasSession = !!((await supabase.auth.getSession()).data.session);
+        console.log("[Registration] Initial session check:", hasSession);
         if (!hasSession) {
           for (let i = 0; i < 4 && !hasSession; i++) {
+            console.log(`[Registration] Sign-in attempt ${i + 1}...`);
             const { error: signInError } = await supabase.auth.signInWithPassword({
               email: normalizedEmail,
               password,
             });
-            if (!signInError) hasSession = true;
-            else await new Promise((r) => setTimeout(r, 350));
+            if (!signInError) {
+              hasSession = true;
+              console.log("[Registration] Sign-in succeeded on attempt", i + 1);
+            } else {
+              console.warn(`[Registration] Sign-in attempt ${i + 1} failed:`, signInError.message);
+              await new Promise((r) => setTimeout(r, 350));
+            }
           }
         }
         if (hasSession) {
+          console.log("[Registration] Session active, navigating to /dashboard");
           navigate("/dashboard");
         } else {
+          console.warn("[Registration] Failed to establish session after registration.");
           toast.info("Your account is created. Please login to continue.");
         }
       }
@@ -864,7 +867,19 @@ export const RegistrationForm = ({
         ) : (
           <>
             <p className="text-muted-foreground mb-6">Student registered successfully.</p>
-            <Button className="w-full" onClick={() => window.location.reload()}>Finish</Button>
+            <Button
+              className="w-full"
+              onClick={async () => {
+                const { data: { session } } = await supabase.auth.getSession();
+                if (session) {
+                  navigate("/dashboard");
+                } else {
+                  navigate("/login");
+                }
+              }}
+            >
+              Finish
+            </Button>
           </>
         )}
       </div>

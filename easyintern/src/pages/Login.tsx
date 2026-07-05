@@ -15,6 +15,7 @@ import {
 import { getSendMailApiUrl } from "@/lib/sendMailApi";
 import { useAuthBackend } from "@/hooks/useBackend";
 import { resolveLoginIdentifier } from "@/lib/resolveLoginIdentifier";
+import { apiClient } from "@/lib/apiClient";
 import type { User } from "@supabase/supabase-js";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -299,6 +300,15 @@ const Login = () => {
       toast.success("Welcome back!");
       navigate(destination);
     } catch (error: any) {
+      try {
+        await apiClient.post('/auth/log-event', {
+          action: 'user.login',
+          outcome: 'failure',
+          details: { email, error: error.message }
+        });
+      } catch (logErr) {
+        console.warn('Failed to send login failure log:', logErr);
+      }
       toast.error(error.message || "Login failed");
     } finally {
       setLoginLoading(false);

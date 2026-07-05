@@ -157,7 +157,6 @@ export class EnrollmentWorker {
         cybercafe_shop_name: studentData.cybercafe_shop_name || null,
         cybercafe_email: studentData.cybercafe_email || null,
         referral_code: referralCode || null,
-        password: finalPassword,
         metadata: {
           subject,
           internship_mode: internshipMode,
