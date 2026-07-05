@@ -321,7 +321,7 @@ export class PaymentService {
       // Find if student is fully created
       const student = await this.studentRepo.findStudentByEmail(order.user_email);
       if (student?.registration_id) {
-        return { status: 'fulfilled', registrationId: student.registration_id };
+        return { status: 'fulfilled', registrationId: student.registration_id, userId: student.id };
       }
       return { status: 'paid_pending_fulfillment' };
     }

@@ -656,14 +656,7 @@ export const RegistrationForm = ({
         toast.info("Payment verified. Setting up your account, please wait...");
         const pollRes = await pollOrderStatus(result.orderId);
         regId = pollRes.registrationId || "";
-
-        // Retrieve the created student ID (userId) from Supabase
-        const { data: studentRecord } = await supabase
-          .from("students")
-          .select("id")
-          .eq("email", normalizedEmail)
-          .maybeSingle();
-        userId = studentRecord?.id;
+        userId = pollRes.userId;
 
         if (!userId) {
           throw new Error("Enrollment finished but account details could not be loaded. Please sign in.");
