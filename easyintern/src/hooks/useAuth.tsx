@@ -61,28 +61,24 @@ export const useAuth = () => {
 
     let lastEvent: string | null = null;
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
       if (event === 'SIGNED_IN' && lastEvent !== 'SIGNED_IN') {
         lastEvent = 'SIGNED_IN';
-        try {
-          await apiClient.post('/auth/log-event', {
-            action: 'user.login',
-            outcome: 'success',
-            details: { email: session?.user?.email }
-          });
-        } catch (err) {
+        apiClient.post('/auth/log-event', {
+          action: 'user.login',
+          outcome: 'success',
+          details: { email: session?.user?.email }
+        }).catch(err => {
           console.warn('Failed to send login audit log:', err);
-        }
+        });
       } else if (event === 'SIGNED_OUT' && lastEvent !== 'SIGNED_OUT') {
         lastEvent = 'SIGNED_OUT';
-        try {
-          await apiClient.post('/auth/log-event', {
-            action: 'user.logout',
-            outcome: 'success'
-          });
-        } catch (err) {
+        apiClient.post('/auth/log-event', {
+          action: 'user.logout',
+          outcome: 'success'
+        }).catch(err => {
           console.warn('Failed to send logout audit log:', err);
-        }
+        });
       }
 
       if (session) {
