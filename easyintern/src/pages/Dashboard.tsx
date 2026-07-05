@@ -22,6 +22,8 @@ const Dashboard = () => {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
   const [activeView, setActiveView] = useState<'home' | 'profile' | 'settings'>('home');
+  const [refetchTrigger, setRefetchTrigger] = useState(0);
+  const retryCountRef = useRef(0);
   const [notifications, setNotifications] = useState<any[]>([]);
   const [assignmentsList, setAssignmentsList] = useState<any[]>([]);
   const [isNotifOpen, setIsNotifOpen] = useState(false);
@@ -181,13 +183,26 @@ const Dashboard = () => {
       setColleges(cData.data || []);
       setDomains(dData.data || []);
 
+      if (!studentData && !isAdminRole && !isStaffRole) {
+        if (retryCountRef.current < 15) {
+          retryCountRef.current += 1;
+          console.log(`[Dashboard] Student profile not found yet (attempt ${retryCountRef.current}/15), retrying...`);
+          setTimeout(() => {
+            setRefetchTrigger(prev => prev + 1);
+          }, 2000);
+          return;
+        } else {
+          console.warn("[Dashboard] Student profile not found after 15 attempts.");
+        }
+      }
+
       setLoading(false);
     })().catch(err => {
       console.error("Dashboard critical error:", err);
       toast.error("Failed to load dashboard data. Please refresh.");
       setLoading(false);
     });
-  }, [navigate]);
+  }, [navigate, refetchTrigger]);
 
   const downloadCert = async () => {
     if (!certRef.current) return;
@@ -507,7 +522,7 @@ const Dashboard = () => {
                 {profile?.full_name?.charAt(0)}
               </div>
               <div>
-                <h1 className="text-3xl md:text-5xl font-bold tracking-tight">Howdy, {profile?.full_name?.split(" ")[0]}!</h1>
+                <h1 className="text-3xl md:text-5xl font-bold tracking-tight">Howdy, {profile?.full_name?.split(" ")?.[0] || "Student"}!</h1>
                 <p className="text-muted-foreground mt-1 flex items-center gap-2">
                   <span className="flex items-center gap-1">Student Dashboard</span>
                   <span className="size-1 rounded-full bg-muted-foreground/30"></span>

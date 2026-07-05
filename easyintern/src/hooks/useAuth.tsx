@@ -12,6 +12,7 @@ export const useAuth = () => {
 
   useEffect(() => {
     const checkAuth = async () => {
+      setLoading(true);
       try {
         const { data: { session } } = await supabase.auth.getSession();
         if (!session) {

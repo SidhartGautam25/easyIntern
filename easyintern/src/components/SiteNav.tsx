@@ -67,7 +67,7 @@ export const SiteNav = () => {
 
   const logout = async () => {
     await supabase.auth.signOut();
-    navigate("/");
+    navigate(loginPath);
   };
 
   return (
@@ -107,7 +107,7 @@ export const SiteNav = () => {
           </div>
 
           <div className="hidden md:flex items-center gap-2">
-            {(isAuthed && (isSuperAdmin || isAdmin || isStaff || isVerified) && !onPublicLoginPage) ? (
+            {(isAuthed && !onPublicLoginPage) ? (
               <>
                 {isSuperAdmin ? (
                   <Button variant="accent" size="sm" onClick={() => navigate("/super-admin")}>Super Admin</Button>
@@ -144,7 +144,7 @@ export const SiteNav = () => {
           <Link to="/contact" className="text-muted-foreground font-medium" onClick={() => setMobileMenuOpen(false)}>Contact</Link>
 
           <div className="pt-4 border-t flex flex-col gap-2">
-            {(isAuthed && (isSuperAdmin || isAdmin || isStaff || isVerified) && !onPublicLoginPage) ? (
+            {(isAuthed && !onPublicLoginPage) ? (
               <>
                 {isSuperAdmin ? (
                   <Button variant="accent" className="w-full" onClick={() => { setMobileMenuOpen(false); navigate("/super-admin"); }}>Super Admin</Button>
